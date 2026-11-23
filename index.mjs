@@ -14,10 +14,10 @@ import {
 } from "./credentials.mjs"
 import { configModels, DEFAULT_API_URL, executeSncsChat, modelsFromSettings } from "./bridge.mjs"
 
-export const PROVIDER_ID = "amazon-quick"
-export const PROVIDER_NAME = "Amazon Quick"
+export const PROVIDER_ID = "amazon-quick-plus"
+export const PROVIDER_NAME = "Amazon Quick Plus"
 export const NPM_PACKAGE = "@ai-sdk/openai-compatible"
-const SESSION_HEADER = "x-amazon-quick-session"
+const SESSION_HEADER = "x-amazon-quick-plus-session"
 
 function decodeBodyText(body) {
   if (typeof body === "string") return body
@@ -82,6 +82,7 @@ export function createAmazonQuickPlugin(deps = {}) {
   const runInvokeQbsApi = deps.invokeQbsApi ?? invokeQbsApi
   const runFetchQuickSettings = deps.fetchQuickSettings ?? fetchQuickSettings
   const runExecuteSncsChat = deps.executeSncsChat ?? executeSncsChat
+  const authDeps = { ...deps, providerId: PROVIDER_ID }
 
   return async function AmazonQuickAuthPlugin(ctx = {}) {
     const client = ctx?.client
@@ -107,7 +108,7 @@ export function createAmazonQuickPlugin(deps = {}) {
           const base = provider?.models && Object.keys(provider.models).length ? provider.models : configModels(PROVIDER_ID, fallbackUrl)
           if (auth?.type !== "oauth" || !(auth.access || auth.source)) return base
           try {
-            const a = await getCurrentAuth(client, auth, deps)
+            const a = await getCurrentAuth(client, auth, authDeps)
             const url = a?.tenantUrl || fallbackUrl
             const settings = await runFetchQuickSettings(a, deps)
             return settings ? modelsFromSettings(PROVIDER_ID, settings, url) : base
@@ -128,13 +129,13 @@ export function createAmazonQuickPlugin(deps = {}) {
           }
           let signInState = "kept"
           try {
-            let a = await getCurrentAuth(client, auth, deps)
+            let a = await getCurrentAuth(client, auth, authDeps)
             let raw
             try {
               raw = await runInvokeQbsApi(a, "profile/usage", "GET", {}, deps)
             } catch (e) {
               if (e?.status !== 401) throw e
-              const r = await getReissuedAuth(client, getAuth, a, auth.access, deps)
+              const r = await getReissuedAuth(client, getAuth, a, auth.access, authDeps)
               if (!r.a) {
                 return { error: refusedReason(a, r.why), signIn: isGone(a, r, e.invalidToken) ? "expired" : "kept" }
               }
@@ -220,7 +221,7 @@ export function createAmazonQuickPlugin(deps = {}) {
           let resolvedBaseUrl = auth?.tenantUrl || DEFAULT_API_URL
           if (!auth?.tenantUrl && auth?.source === "desktop") {
             try {
-              const a = await getCurrentAuth(client, auth, deps)
+              const a = await getCurrentAuth(client, auth, authDeps)
               if (a?.tenantUrl) resolvedBaseUrl = a.tenantUrl
             } catch {}
           }
@@ -234,7 +235,7 @@ export function createAmazonQuickPlugin(deps = {}) {
                 const list = Object.values(configModels(PROVIDER_ID, resolvedBaseUrl)).map((m) => ({
                   id: m.id,
                   object: "model",
-                  owned_by: "amazon-quick",
+                  owned_by: PROVIDER_ID,
                 }))
                 return new Response(JSON.stringify({ object: "list", data: list }), {
                   status: 200,
@@ -247,7 +248,7 @@ export function createAmazonQuickPlugin(deps = {}) {
               }
               let a
               try {
-                a = await getCurrentAuth(client, stored, deps)
+                a = await getCurrentAuth(client, stored, authDeps)
               } catch (e) {
                 if (e?.refreshRefused) {
                   return signedOutResponse(stored, e.message, stored.source !== "desktop")
@@ -283,7 +284,7 @@ export function createAmazonQuickPlugin(deps = {}) {
                     { status, headers: { "content-type": "application/json" } },
                   )
                 }
-                const r = await getReissuedAuth(client, getAuth, a, stored.access, deps)
+                const r = await getReissuedAuth(client, getAuth, a, stored.access, authDeps)
                 if (!r.a) return signedOutResponse(a, r.why, isGone(a, r, err.invalidToken))
                 a = r.a
                 try {

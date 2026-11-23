@@ -128,7 +128,7 @@ export function buildProviderModelEntry(providerID, spec, baseURL = DEFAULT_API_
   }
 }
 
-export function configModels(providerID = "amazon-quick", baseURL = DEFAULT_API_URL) {
+export function configModels(providerID = "amazon-quick-plus", baseURL = DEFAULT_API_URL) {
   const out = {}
   for (const spec of Object.values(DEFAULT_MODELS)) {
     out[spec.id] = buildProviderModelEntry(providerID, spec, baseURL)
@@ -182,7 +182,7 @@ export function modelsFromSettings(providerID, settings, baseURL = DEFAULT_API_U
 }
 
 /**
- * Map an OpenAI-style `model` id (including `amazon-quick/...` prefix or `@effort` suffix)
+ * Map an OpenAI-style `model` id (including `amazon-quick-plus/...` prefix or `@effort` suffix)
  * and body reasoning hints into SNCS `{ modelId, agentMode, autoRouting, thinkingEffort }`.
  */
 export function resolveModelAndEffort(requestedModel, body = {}) {

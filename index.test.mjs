@@ -291,7 +291,7 @@ test("invokeQbsApi and usageFromProfile support AIDP & Gateway transports", asyn
 })
 
 test("model mapping, tool-call splitter, and openaiToSncsRequest handle variants and chunk boundaries", () => {
-  const dynModels = modelsFromSettings("amazon-quick", {
+  const dynModels = modelsFromSettings("amazon-quick-plus", {
     advanced_mode_enabled: true,
     model_slots: [{ id: "balanced", display_name: "Sonnet Custom", thinking: { mode: "optional", efforts: ["off", "high"], default_effort: "off" } }],
   })
@@ -299,7 +299,7 @@ test("model mapping, tool-call splitter, and openaiToSncsRequest handle variants
   assert.deepEqual(Object.keys(dynModels.balanced.variants), ["off", "high"])
   assert.ok(dynModels.advanced)
 
-  assert.deepEqual(resolveModelAndEffort("amazon-quick/balanced@high"), {
+  assert.deepEqual(resolveModelAndEffort("amazon-quick-plus/balanced@high"), {
     modelId: "balanced",
     agentMode: "balanced",
     autoRouting: false,
@@ -311,13 +311,13 @@ test("model mapping, tool-call splitter, and openaiToSncsRequest handle variants
     autoRouting: false,
     thinkingEffort: "off",
   })
-  assert.deepEqual(resolveModelAndEffort("amazon-quick/smart[1m]"), {
+  assert.deepEqual(resolveModelAndEffort("amazon-quick-plus/smart[1m]"), {
     modelId: "smart",
     agentMode: "smart",
     autoRouting: false,
     thinkingEffort: "off",
   })
-  assert.deepEqual(resolveModelAndEffort("amazon-quick/smart@high[1m]"), {
+  assert.deepEqual(resolveModelAndEffort("amazon-quick-plus/smart@high[1m]"), {
     modelId: "smart",
     agentMode: "smart",
     autoRouting: false,
@@ -645,9 +645,9 @@ test("AmazonQuickAuthPlugin executes SSE streaming, 401 token retry, usage, and 
   // config hook
   const cfg = {}
   await plugin.config(cfg)
-  assert.equal(cfg.provider["amazon-quick"].npm, "@ai-sdk/openai-compatible")
-  assert.equal(cfg.provider["amazon-quick"].api, "https://quick.aws.com/v1")
-  assert.equal(cfg.provider["amazon-quick"].models.balanced.api.url, "https://quick.aws.com/v1")
+  assert.equal(cfg.provider["amazon-quick-plus"].npm, "@ai-sdk/openai-compatible")
+  assert.equal(cfg.provider["amazon-quick-plus"].api, "https://quick.aws.com/v1")
+  assert.equal(cfg.provider["amazon-quick-plus"].models.balanced.api.url, "https://quick.aws.com/v1")
 
   // loader SSE stream with 401 refresh recovery (plus Uint8Array body & non-empty baseURL)
   const loader = await plugin.auth.loader(async () => stored)
@@ -703,10 +703,10 @@ test("AmazonQuickAuthPlugin executes SSE streaming, 401 token retry, usage, and 
     aisdk: { hook: async () => {} },
   })
   assert.equal(addedMethods.length, 4)
-  assert.equal(addedMethods[0].integrationID, "amazon-quick")
+  assert.equal(addedMethods[0].integrationID, "amazon-quick-plus")
   assert.match(addedMethods[2].method.label, /设备码登录/)
   assert.equal(addedMethods[2].method.form?.every((f) => !f.required), true)
-  assert.equal(addedProviders[0].info.id, "amazon-quick")
+  assert.equal(addedProviders[0].info.id, "amazon-quick-plus")
 
   const pkgJson = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf8"))
   assert.ok(pkgJson.magpie?.icon?.startsWith("data:image/png;base64,"))
@@ -1300,7 +1300,7 @@ test("macOS Keychain timeout/denied negative cache, actionable errors, and brows
 
     // 2. Auth methods list puts browser OIDC first and labels macOS Keychain caveat on desktop sign-in
     const macPlugin = await createAmazonQuickPlugin({ platform: "darwin" })({})
-    assert.equal(macPlugin.auth.methods[0].label, "Amazon Quick 浏览器登录（推荐）")
+    assert.equal(macPlugin.auth.methods[0].label, "Amazon Quick Plus 浏览器登录（推荐）")
     assert.match(macPlugin.auth.methods[1].label, /macOS 需钥匙串密码/)
     assert.match(macPlugin.auth.methods[2].label, /设备码登录/)
     assert.match(macPlugin.auth.methods[3].label, /企业版 \/ 自定义 OIDC/)

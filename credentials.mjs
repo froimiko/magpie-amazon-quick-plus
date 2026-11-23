@@ -521,7 +521,7 @@ export async function currentAuth(client, auth, opts = {}) {
   if (!stale(a, REFRESH_LEAD_MS, opts.now) || !refreshable(a, opts.now)) return a
   try {
     return await renewOidc(a, async (next) => {
-      await client?.auth?.set?.({ path: { id: "amazon-quick" }, body: next })
+      await client?.auth?.set?.({ path: { id: opts.providerId ?? "amazon-quick-plus" }, body: next })
     }, opts)
   } catch (e) {
     if (!e?.refreshRefused && a.expires > (opts.now ?? Date.now())) return a
@@ -553,7 +553,7 @@ export async function reissuedAuth(client, getAuth, a, beganAccess, opts = {}) {
   }
   try {
     const next = await renewOidc(a, async (n) => {
-      await client?.auth?.set?.({ path: { id: "amazon-quick" }, body: n })
+      await client?.auth?.set?.({ path: { id: opts.providerId ?? "amazon-quick-plus" }, body: n })
     }, opts)
     return next.access !== a.access ? { a: next } : { why: "renewing gave the same access token", kind: "unknown" }
   } catch (e) {
