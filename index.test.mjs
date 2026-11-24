@@ -2514,3 +2514,73 @@ test("createToolCallSplitter ignores code fences/backticks, validates declared t
   // Only the real closing tag should match unescaped `</tool_result>`
   assert.equal((wireText.match(/<\/tool_result>/gi) || []).length, 1, "only the real wrapper closing </tool_result> should remain unescaped")
 })
+
+test("browserSignIn without local profiles.json runs 2-hop quick.aws.com/sn discovery with &port= and user-info enrichment", async () => {
+  const missingDir = join(tmpdir(), "aq-missing-discovery-" + Date.now())
+  let regBody = null
+  let tokBody = null
+  const mockFetch = async (url, init) => {
+    const s = String(url)
+    if (s === "https://oidc.us-east-1.amazonaws.com/client/register") {
+      regBody = JSON.parse(init.body)
+      return new Response(JSON.stringify({ clientId: "cid-disc-1", clientSecret: "sec-disc-1" }), { status: 200 })
+    }
+    if (s === "https://oidc.us-east-1.amazonaws.com/token") {
+      tokBody = JSON.parse(init.body)
+      return new Response(JSON.stringify({ accessToken: "tok-disc-1", refreshToken: "ref-disc-1", expiresIn: 3600 }), { status: 200 })
+    }
+    if (s === "https://qbs-disc.dp.appintegrations.us-east-1.prod.plato.ai.aws.dev/integration/quick-work/user-info") {
+      return new Response(
+        JSON.stringify({
+          email: "tester@example.com",
+          displayName: "DemoTester",
+          awsAccountId: "123456789012",
+        }),
+        { status: 200 },
+      )
+    }
+    return new Response("{}", { status: 404 })
+  }
+
+  const flow = await browserSignIn({}, { dir: missingDir, fetch: mockFetch })
+  const startUrl = new URL(flow.url)
+  assert.equal(startUrl.origin + startUrl.pathname, "https://quick.aws.com/sn")
+  const portParam = startUrl.searchParams.get("port")
+  assert.match(portParam || "", /^\d+$/)
+  const surfaceParts = (startUrl.searchParams.get("qwSurface") || "").split(":")
+  assert.equal(surfaceParts[0], "desktop")
+  assert.equal(surfaceParts[2], portParam)
+  const nonce = surfaceParts[1]
+  assert.ok(nonce.length >= 16)
+
+  const cbPromise = flow.callback()
+
+  // Hop 1: Magpie openPastedCallback hits /callback without following redirects
+  const hop1 = await fetch(
+    `http://127.0.0.1:${portParam}/callback?nonce=${encodeURIComponent(nonce)}&issuerUrl=${encodeURIComponent("https://identitycenter.amazonaws.com/ssoins-7223e642b2afb64c")}&tenantUrl=${encodeURIComponent("https://qbs-disc.dp.appintegrations.us-east-1.prod.plato.ai.aws.dev")}&idcRegion=us-east-1`,
+    { redirect: "manual" },
+  )
+  assert.equal(hop1.status, 302)
+  const nextLoc = new URL(hop1.headers.get("location"))
+  assert.equal(nextLoc.origin + nextLoc.pathname, "https://oidc.us-east-1.amazonaws.com/authorize")
+  assert.equal(nextLoc.searchParams.get("client_id"), "cid-disc-1")
+  assert.equal(nextLoc.searchParams.get("redirect_uri"), `http://127.0.0.1:${portParam}`)
+  assert.deepEqual(regBody.redirectUris, [`http://127.0.0.1:${portParam}`])
+
+  // Hop 2: user pastes /?code=...&state=...
+  const hop2 = await fetch(
+    `http://127.0.0.1:${portParam}/?code=disc-auth-code&state=${encodeURIComponent(nextLoc.searchParams.get("state"))}`,
+  )
+  assert.equal(hop2.status, 200)
+
+  const res = await cbPromise
+  assert.equal(res.type, "success")
+  assert.equal(res.access, "tok-disc-1")
+  assert.equal(res.refresh, "ref-disc-1")
+  assert.equal(res.tenantUrl, "https://qbs-disc.dp.appintegrations.us-east-1.prod.plato.ai.aws.dev")
+  assert.equal(res.email, "tester@example.com")
+  assert.equal(res.displayName, "DemoTester")
+  assert.equal(res.awsAccountId, "123456789012")
+  assert.equal(res.accountId, "tester@example.com")
+  assert.equal(tokBody.code, "disc-auth-code")
+})
