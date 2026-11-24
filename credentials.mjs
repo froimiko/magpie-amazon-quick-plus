@@ -7,6 +7,8 @@ import { join } from "node:path"
 
 export const APP_VERSION = "1.2.4660"
 export const DEFAULT_SOCIAL_ISSUER_URL = "https://identitycenter.amazonaws.com/ssoins-7223e642b2afb64c"
+export const DEFAULT_SOCIAL_DISCOVERY_URL = "https://quick.aws.com/sn"
+export const DEFAULT_SOCIAL_DATA_PLANE = "https://cell001.dp.appintegrations.us-east-1.prod.plato.ai.aws.dev"
 export const REFRESH_LEAD_MS = 5 * 60 * 1000
 export const KEEP_RENEWED_MS = 60 * 1000
 export const SIGN_IN_TIMEOUT_MS = 10 * 60 * 1000
@@ -696,31 +698,149 @@ function sleepAbortable(ms, signal) {
   })
 }
 
-export async function browserSignIn(inputs = {}, opts = {}) {
-  const { issuerUrl, tenantUrl, providerType, region } = resolveOidcContext(inputs, opts)
-  if (!tenantUrl) {
-    throw new Error(
-      'Missing Amazon Quick Tenant URL (qbs-...plato.ai.aws.dev): sign in on Amazon Quick desktop once on this machine, or for VPS / remote / headless setups use "Amazon Quick Device Code (VPS / Remote / Headless)" or "Import accounts from a file…".',
-    )
+async function fetchQuickUserInfo(tenantUrl, accessToken, fetchImpl = fetch) {
+  const base = normalizeHttpsUrl(tenantUrl)
+  if (!base || !accessToken) return {}
+  const infoBase = base.includes("dp.appintegrations") ? base : DEFAULT_SOCIAL_DATA_PLANE
+  try {
+    const res = await fetchImpl(`${infoBase}/integration/quick-work/user-info`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        Authorization: `Bearer ${accessToken}`,
+      },
+      body: "{}",
+      signal: AbortSignal.timeout(8000),
+    })
+    if (!res.ok) return {}
+    const parsed = await res.json().catch(() => null)
+    const raw = parsed && typeof parsed.userInfo === "object" ? parsed.userInfo : parsed
+    if (!raw || typeof raw !== "object") return {}
+    return {
+      email: str(raw.email ?? raw.emailAddress),
+      displayName: str(raw.displayName ?? raw.display_name ?? raw.userName ?? raw.user_name ?? raw.username),
+      awsAccountId: str(raw.awsAccountId ?? raw.aws_account_id ?? raw.accountId),
+    }
+  } catch {
+    return {}
   }
-  const fetchImpl = opts.fetch ?? fetch
-  const oidcBase = `https://oidc.${region}.amazonaws.com`
+}
 
-  // Start loopback HTTP server for authorization code redirect
+export async function browserSignIn(inputs = {}, opts = {}) {
+  const initialCtx = resolveOidcContext(inputs, opts)
+  const useDiscovery = !initialCtx.tenantUrl || inputs?.useDiscovery === true || opts?.useDiscovery === true
+  const fetchImpl = opts.fetch ?? fetch
+
+  const codeVerifier = base64Url(randomBytes(32))
+  const codeChallenge = base64Url(createHash("sha256").update(codeVerifier).digest())
+  const expectedState = base64Url(randomBytes(16))
+  const discoveryNonce = base64Url(randomBytes(24))
+
+  let activeIssuerUrl = initialCtx.issuerUrl
+  let activeTenantUrl = initialCtx.tenantUrl
+  let activeProviderType = initialCtx.providerType
+  let activeRegion = initialCtx.region
+  let activeClientId = ""
+  let activeClientSecret = ""
+
+  // Start loopback HTTP server for discovery + authorization code redirect
   let resolveCode, rejectCode
   const codePromise = new Promise((resolve, reject) => {
     resolveCode = resolve
     rejectCode = reject
   })
-  const server = createServer((req, res) => {
+
+  const registerClient = async (regionVal, issuerVal, redirectUri) => {
+    const oidcBase = `https://oidc.${regionVal}.amazonaws.com`
+    const regRes = await fetchImpl(`${oidcBase}/client/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        clientName: "Amazon Quick",
+        clientType: "public",
+        scopes: ["quicksight:read_write"],
+        grantTypes: ["authorization_code", "refresh_token"],
+        redirectUris: [redirectUri],
+        issuerUrl: issuerVal,
+      }),
+    })
+    const regJson = await regRes.json().catch(() => ({}))
+    if (!regRes.ok || !regJson?.clientId) {
+      throw new Error(
+        `OIDC client registration failed (${regRes.status}): ${regJson?.error_description || regJson?.message || regRes.statusText}`,
+      )
+    }
+    return regJson
+  }
+
+  const buildAuthorizeUrl = (regionVal, clientIdVal, redirectUri) => {
+    const authUrl = new URL(`https://oidc.${regionVal}.amazonaws.com/authorize`)
+    authUrl.searchParams.set("response_type", "code")
+    authUrl.searchParams.set("client_id", clientIdVal)
+    authUrl.searchParams.set("redirect_uri", redirectUri)
+    authUrl.searchParams.set("scope", "quicksight:read_write")
+    authUrl.searchParams.set("state", expectedState)
+    authUrl.searchParams.set("code_challenge", codeChallenge)
+    authUrl.searchParams.set("code_challenge_method", "S256")
+    authUrl.searchParams.set("prompt", "login")
+    return authUrl
+  }
+
+  let listenPort = 0
+  const server = createServer(async (req, res) => {
     try {
-      const u = new URL(req.url || "/", "http://127.0.0.1")
+      const u = new URL(req.url || "/", `http://127.0.0.1:${listenPort || 80}`)
       if (u.pathname === "/favicon.ico") {
         res.writeHead(204)
         res.end()
         return
       }
-      if (u.pathname !== "/" && u.pathname !== "/callback") {
+      if (useDiscovery && u.pathname === "/callback") {
+        const q = u.searchParams
+        if (q.get("nonce") !== discoveryNonce) {
+          res.writeHead(400, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" })
+          res.end("<html><body><h3>Amazon Quick sign-in failed</h3><p>Discovery nonce mismatch (stale login link?)</p></body></html>")
+          rejectCode(new Error("Discovery nonce mismatch (stale login link?)"))
+          return
+        }
+        const err = q.get("error")
+        const errDesc = q.get("error_description")
+        if (err) {
+          res.writeHead(400, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" })
+          res.end(`<html><body><h3>Amazon Quick sign-in failed</h3><p>${err}: ${errDesc || ""}</p></body></html>`)
+          rejectCode(new Error(`${err}: ${errDesc || "discovery failed"}`))
+          return
+        }
+        const discIssuer = normalizeHttpsUrl(q.get("issuerUrl") || q.get("issuer_url") || q.get("issuer") || DEFAULT_SOCIAL_ISSUER_URL)
+        const discTenant = normalizeHttpsUrl(q.get("tenantUrl") || q.get("tenant_url")) || DEFAULT_SOCIAL_DATA_PLANE
+        const discRegion =
+          str(q.get("idcRegion") || q.get("idc_region")) ||
+          regionFromUrl(discIssuer) ||
+          regionFromUrl(discTenant) ||
+          activeRegion ||
+          "us-east-1"
+        const discHost = hostFromUrl(discTenant)
+        const looksGateway = /\.(?:desktop\.)?(?:enterprise\.)?quick\.aws\.(?:com|dev)$/i.test(discHost)
+        const discProvider = looksGateway
+          ? "gateway"
+          : discIssuer === DEFAULT_SOCIAL_ISSUER_URL || /\/ssoins-/i.test(discIssuer)
+            ? "social"
+            : "enterprise"
+        const redirectUri = `http://127.0.0.1:${listenPort}`
+        const regJson = await registerClient(discRegion, discIssuer, redirectUri)
+        activeIssuerUrl = discIssuer
+        activeTenantUrl = discTenant
+        activeRegion = discRegion
+        activeProviderType = discProvider
+        activeClientId = regJson.clientId
+        activeClientSecret = regJson.clientSecret || ""
+        const nextAuthUrl = buildAuthorizeUrl(discRegion, activeClientId, redirectUri)
+        res.writeHead(302, { Location: nextAuthUrl.toString(), "Cache-Control": "no-store" })
+        res.end()
+        return
+      }
+      if (u.pathname !== "/" && u.pathname !== "/index.html" && u.pathname !== "/callback") {
         res.writeHead(404)
         res.end("Not found")
         return
@@ -730,11 +850,22 @@ export async function browserSignIn(inputs = {}, opts = {}) {
       const code = u.searchParams.get("code")
       const state = u.searchParams.get("state")
       if (!err && !code) {
+        if (useDiscovery && (u.pathname === "/" || u.pathname === "/index.html")) {
+          res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" })
+          res.end("<html><body><h3>Finish signing in</h3><p>Complete Amazon Quick sign-in in the browser tab and return here.</p></body></html>")
+          return
+        }
         res.writeHead(400)
         res.end("Missing code")
         return
       }
-      res.writeHead(err ? 400 : 200, { "Content-Type": "text/html; charset=utf-8" })
+      if (useDiscovery && !err && !activeClientId) {
+        res.writeHead(400, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" })
+        res.end("<html><body><h3>Amazon Quick sign-in failed</h3><p>Discovery step (/callback) has not completed yet.</p></body></html>")
+        rejectCode(new Error("Discovery step (/callback) has not completed yet"))
+        return
+      }
+      res.writeHead(err ? 400 : 200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" })
       res.end(
         err
           ? `<html><body><h3>Amazon Quick sign-in failed</h3><p>${err}: ${errDesc || ""}</p></body></html>`
@@ -743,6 +874,12 @@ export async function browserSignIn(inputs = {}, opts = {}) {
       if (err) rejectCode(new Error(`${err}: ${errDesc || "authorization failed"}`))
       else resolveCode({ code, state })
     } catch (e) {
+      try {
+        if (!res.headersSent) {
+          res.writeHead(502, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" })
+          res.end(`<html><body><h3>Amazon Quick sign-in failed</h3><p>${e?.message ?? String(e)}</p></body></html>`)
+        }
+      } catch {}
       rejectCode(e)
     }
   })
@@ -758,63 +895,45 @@ export async function browserSignIn(inputs = {}, opts = {}) {
   }, abandonMs)
   abandonTimer.unref?.()
   const addr = server.address()
-  const redirectUri = `http://127.0.0.1:${addr.port}`
+  listenPort = addr.port
+  const redirectUri = `http://127.0.0.1:${listenPort}`
 
-  let regRes
-  try {
-    regRes = await fetchImpl(`${oidcBase}/client/register`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        clientName: "Amazon Quick",
-        clientType: "public",
-        scopes: ["quicksight:read_write"],
-        grantTypes: ["authorization_code", "refresh_token"],
-        redirectUris: [redirectUri],
-        issuerUrl,
-      }),
-    })
-  } catch (e) {
-    clearTimeout(abandonTimer)
-    server.close()
-    throw e
+  let startUrl = ""
+  if (useDiscovery) {
+    const discoveryBase = str(opts.discoveryUrl) || DEFAULT_SOCIAL_DISCOVERY_URL
+    const qwSurface = encodeURIComponent(`desktop:${discoveryNonce}:${listenPort}:${APP_VERSION}`)
+    startUrl = `${discoveryBase}?qwSurface=${qwSurface}&port=${listenPort}`
+  } else {
+    try {
+      const regJson = await registerClient(activeRegion, activeIssuerUrl, redirectUri)
+      activeClientId = regJson.clientId
+      activeClientSecret = regJson.clientSecret || ""
+    } catch (e) {
+      clearTimeout(abandonTimer)
+      server.close()
+      throw e
+    }
+    startUrl = buildAuthorizeUrl(activeRegion, activeClientId, redirectUri).toString()
   }
-  const regJson = await regRes.json().catch(() => ({}))
-  if (!regRes.ok || !regJson?.clientId) {
-    clearTimeout(abandonTimer)
-    server.close()
-    throw new Error(`OIDC client registration failed (${regRes.status}): ${regJson?.error_description || regJson?.message || regRes.statusText}`)
-  }
-
-  const codeVerifier = base64Url(randomBytes(32))
-  const codeChallenge = base64Url(createHash("sha256").update(codeVerifier).digest())
-  const expectedState = base64Url(randomBytes(16))
-
-  const authUrl = new URL(`${oidcBase}/authorize`)
-  authUrl.searchParams.set("response_type", "code")
-  authUrl.searchParams.set("client_id", regJson.clientId)
-  authUrl.searchParams.set("redirect_uri", redirectUri)
-  authUrl.searchParams.set("scope", "quicksight:read_write")
-  authUrl.searchParams.set("state", expectedState)
-  authUrl.searchParams.set("code_challenge", codeChallenge)
-  authUrl.searchParams.set("code_challenge_method", "S256")
-  authUrl.searchParams.set("prompt", "login")
 
   return {
-    url: authUrl.toString(),
-    instructions: "Complete AWS IAM Identity Center sign-in in the browser; this completes automatically.",
+    url: startUrl,
+    instructions: useDiscovery
+      ? "在浏览器中完成 Amazon Quick 登录；若运行在 Docker / 远程服务器上，跳转 127.0.0.1 失败时请分两步粘回下方回调框（第 1 步粘回 /callback?... 会自动刷新出第 2 步 oidc 链接，再次打开后粘回 /?code=...）。"
+      : "Complete AWS IAM Identity Center sign-in in the browser; if running on Docker / remote server, paste the 127.0.0.1 callback URL back into Magpie.",
     method: "auto",
     async callback() {
       const timer = setTimeout(() => rejectCode(new Error("Timed out waiting for Amazon Quick browser sign-in")), opts.timeoutMs ?? SIGN_IN_TIMEOUT_MS)
       try {
         const { code, state } = await codePromise
         if (!code || state !== expectedState) return { type: "failed", error: "OAuth state mismatch or missing code" }
+        const oidcBase = `https://oidc.${activeRegion}.amazonaws.com`
         const tokRes = await fetchImpl(`${oidcBase}/token`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            clientId: regJson.clientId,
-            ...(regJson.clientSecret ? { clientSecret: regJson.clientSecret } : {}),
+            clientId: activeClientId,
+            ...(activeClientSecret ? { clientSecret: activeClientSecret } : {}),
             grantType: "authorization_code",
             code,
             redirectUri,
@@ -825,19 +944,23 @@ export async function browserSignIn(inputs = {}, opts = {}) {
         if (!tokRes.ok || !tok?.accessToken) {
           return { type: "failed", error: `OIDC token exchange failed: ${tok?.error_description || tok?.message || tokRes.status}` }
         }
+        const userInfo = activeProviderType === "gateway" ? {} : await fetchQuickUserInfo(activeTenantUrl, tok.accessToken, fetchImpl)
         const expiresIn = Number(tok.expiresIn) > 0 ? Number(tok.expiresIn) : 3600
         return {
           ...normalizeAuth({
             access: tok.accessToken,
             refresh: tok.refreshToken || "",
             expires: Date.now() + expiresIn * 1000,
-            clientId: regJson.clientId,
-            clientSecret: regJson.clientSecret || "",
-            issuerUrl,
-            tenantUrl,
-            region,
-            providerType,
-            accountId: hostFromUrl(tenantUrl) || "Amazon Quick",
+            clientId: activeClientId,
+            clientSecret: activeClientSecret,
+            issuerUrl: activeIssuerUrl,
+            tenantUrl: activeTenantUrl,
+            region: activeRegion,
+            providerType: activeProviderType,
+            ...(userInfo.email ? { email: userInfo.email } : {}),
+            ...(userInfo.displayName ? { displayName: userInfo.displayName } : {}),
+            ...(userInfo.awsAccountId ? { awsAccountId: userInfo.awsAccountId } : {}),
+            accountId: userInfo.email || userInfo.displayName || hostFromUrl(activeTenantUrl) || "Amazon Quick",
           }),
           type: "success",
         }

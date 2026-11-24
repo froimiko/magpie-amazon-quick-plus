@@ -39,8 +39,8 @@ https://github.com/yubanmeiqin9048/magpie-amazon-quick-plus
 
 ## 登录方式
 
-1. **Amazon Quick 浏览器登录（推荐）** *（尤其在 macOS 上：一键浏览器授权，独立会话，不触碰系统钥匙串）*
-   - 直接打开浏览器前往 AWS IAM Identity Center（支持 Google / Amazon / Builder ID 等登录），完成授权后自动回传独立的 `access_token` 与 `refresh_token`，不依赖桌面端保持运行（`tenantUrl` 会从本机 `~/.quickwork/profiles.json` 自动识别）。
+1. **Amazon Quick 浏览器登录（推荐）** *（支持本机与 Docker / 远程网页端；一键或两步回调完成授权，不触碰系统钥匙串）*
+   - 若本机已存在 `~/.quickwork/profiles.json` 则直接拉起 AWS IAM Identity Center 登录；若未安装桌面端（如 Docker / 远程部署），自动通过 `quick.aws.com/sn` 两跳发现流程获取账号 `tenantUrl` 与邮箱信息，并附带 `&port=` 触发 Magpie 回调粘贴框（分两步粘贴 `/callback?...` 与 `/?code=...` 即可完成远程登录）。
    - **若浏览器打开后提示 `Your session has expired`**：通常是浏览器里残留了过期的 AWS Builder ID 会话 Cookie（`signin.aws`）。在浏览器地址栏左侧进入「Cookie 和网站数据 → 管理设备上的网站数据」（或 Chrome 打开 `chrome://settings/content/all?searchSubpage=signin.aws`）清除 `signin.aws` / `us-east-1.signin.aws` 的全部 Cookie 后重试即可；也可将授权链接复制到无痕窗口打开完成登录。
 2. **复用 Amazon Quick 桌面端登录** *（Windows / Linux 开箱即用，macOS 会触发钥匙串授权）*
    - 自动复用当前桌面端已登录账号，不会改动磁盘或凭据库中的刷新令牌。
