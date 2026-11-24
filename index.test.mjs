@@ -2821,3 +2821,185 @@ test("MAGPIE_QUICK_WEB_SEARCH controls the default web_search_enabled value", ()
     else process.env.MAGPIE_QUICK_WEB_SEARCH = prev
   }
 })
+
+test("system instructions survive the overflow pipeline: anchor inline, full text in an attachment", async () => {
+  const pad = (n) => "（性格补充：温和机敏，先问再答）。".repeat(n)
+  // Large enough that it cannot ride inline whole: this is the frame Stage 3 has
+  // to trim, which is the case that used to lose the text silently.
+  const SYS = "SYSTEM-HEAD-MARKER 【人设：红白】PERSONA-KEY-RULE 自称红白 " + pad(4000) + " SYSTEM-TAIL-MARKER"
+
+  // Case A: a system prompt too large for the frame with a one-line user
+  // message. Stage 4 never engages here, so only Stage 3's spill saves it.
+  const small = openaiToSncsRequest({ model: "balanced", messages: [{ role: "system", content: SYS }, { role: "user", content: "短问" }] }, {})
+  const smallWire = buildAidpInputFrame({ type: "user_message", payload: small.userMessagePayload }).byteLength
+  assert.ok(smallWire <= MAX_USER_MESSAGE_FRAME_BYTES, `frame must stay within budget, got ${smallWire}`)
+  const smallText = small.userMessagePayload.text
+  assert.ok(smallText.includes("<instructions>"), "the instruction block must never disappear")
+  assert.ok(smallText.includes("SYSTEM-HEAD-MARKER"), "a head anchor must ride inline")
+  assert.match(smallText, /attached_files\/system_instructions\.txt lines \d+-\d+/i, "the frame must point at the attachment")
+  assert.ok(small.sysAttachmentText.includes("PERSONA-KEY-RULE"), "middle content survives only in the attachment")
+  assert.ok(small.sysAttachmentText.includes("SYSTEM-TAIL-MARKER"))
+  assert.equal(small.sysAttachmentText, SYS, "the attachment must carry the verbatim original")
+  assert.equal(small.systemDelivered, true)
+
+  // Case B: a large CJK final turn alongside the system prompt.
+  let finalTurn = "【时间线注入】"
+  while (finalTurn.length < 27_000) finalTurn += "时间线条目内容含元思考链片段。"
+  const big = openaiToSncsRequest({ model: "balanced", messages: [{ role: "system", content: SYS }, { role: "user", content: finalTurn }] }, {})
+  const bigText = big.userMessagePayload.text
+  const bigWire = buildAidpInputFrame({ type: "user_message", payload: big.userMessagePayload }).byteLength
+  assert.ok(bigWire <= MAX_USER_MESSAGE_FRAME_BYTES, `frame must stay within budget, got ${bigWire}`)
+  assert.ok(bigText.includes("<instructions>"))
+  assert.ok(bigText.includes("SYSTEM-HEAD-MARKER"))
+  const deliveredSys = bigText.includes("PERSONA-KEY-RULE") || (big.sysAttachmentText || "").includes("PERSONA-KEY-RULE")
+  assert.ok(deliveredSys, "the persona rule must reach the model through the frame or the attachment")
+  assert.ok(big.systemDelivered)
+})
+
+test("system attachment is generated whenever Stage 3 trims the system prompt, even with a huge system and a short turn", async () => {
+  const pad = (n) => "（规则条目）。".repeat(n)
+  const SYS = "BIG-SYS-HEAD " + pad(4000) + " BIG-SYS-MID " + pad(4000) + " BIG-SYS-TAIL"
+  const plan = openaiToSncsRequest({ model: "balanced", messages: [{ role: "system", content: SYS }, { role: "user", content: "hi" }] }, {})
+  assert.ok(plan.sysAttachmentText.length > 0, "a trimmed system prompt must be spilled to an attachment")
+  assert.equal(plan.sysAttachmentText, SYS)
+  assert.match(plan.sysAttachmentRange.name, /^system_instructions\.txt$/)
+  assert.equal(plan.sysAttachmentRange.startLine, 1)
+  assert.equal(plan.sysAttachmentRange.endLine, SYS.split("\n").length)
+  const wire = buildAidpInputFrame({ type: "user_message", payload: plan.userMessagePayload }).byteLength
+  assert.ok(wire <= MAX_USER_MESSAGE_FRAME_BYTES, `frame must stay within budget, got ${wire}`)
+
+  // An untrimmed system prompt allocates no attachment at all.
+  const plain = openaiToSncsRequest({ model: "balanced", messages: [{ role: "system", content: "SHORT SYS" }, { role: "user", content: "hi" }] }, {})
+  assert.equal(plain.sysAttachmentText, "")
+  assert.equal(plain.sysAttachmentRange, null)
+  assert.equal(plain.systemDelivered, true)
+})
+
+test("a thread that never received its system prompt is repaired on the next resume", async () => {
+  const store = createThreadStore()
+  const acct = { providerType: "social", access: "tok-heal", tenantUrl: "https://qbs-heal.plato.ai.aws.dev", accountId: "heal" }
+  const sent = []
+  const WS = makeMockWebSocketClass((ws) => {
+    ws.readyState = 1
+    ws.onopen?.()
+    queueMicrotask(() => {
+      for (const raw of ws.sent) {
+        const outer = JSON.parse(Buffer.from(raw).toString("utf8"))
+        const inner = JSON.parse(Buffer.from(outer.payload.payload, "base64").toString("utf8"))
+        if (inner.type === "user_message") sent.push(inner.payload)
+      }
+      ws.emitAidpEvent({ type: "session_established", payload: {} })
+      ws.emitAidpEvent({ type: "text_delta", payload: { delta: "ok" } })
+      ws.emitAidpEvent({ type: "message_complete", payload: {} })
+    })
+  })
+  const uploader = async (_a, file) => ({
+    type: "file",
+    name: file.name,
+    size: file.bytes.byteLength,
+    mimeType: file.mimeType,
+    path: `/workspace/attached_files/${file.name}`,
+    attachmentId: "att-sys",
+    contentSha256: "sha-sys",
+  })
+  const pad = (n) => "（性格补充）。".repeat(n)
+  // Too large to ever ride inline: the only whole copy is the attachment.
+  const SYS = "HEAL-HEAD 【人设：红白】" + pad(4000) + " HEAL-TAIL"
+  let bigTurn = "【时间线】"
+  while (bigTurn.length < 27_000) bigTurn += "条目内容。"
+  const run = (msgs) => {
+    sent.length = 0
+    return executeSncsChat(acct, { model: "balanced", stream: false, messages: msgs }, {
+      WebSocket: WS,
+      threadStore: store,
+      stateful: true,
+      disableAttachments: false,
+      uploadAttachment: uploader,
+    })
+  }
+
+  // T1: the system prompt is trimmed, so only the attachment carries it whole.
+  await run([{ role: "system", content: SYS }, { role: "user", content: bigTurn }])
+  const t1 = sent[sent.length - 1]
+  assert.ok(t1.text.includes("<instructions>"), "T1 keeps an inline instruction block")
+  assert.ok((t1.attachments || []).some((a) => a.name === "system_instructions.txt"), "T1 uploads the full system text")
+  assert.ok(t1.text.includes("HEAL-HEAD"))
+
+  // T2: the thread never held the text inline, so it must be re-sent in full.
+  await run([{ role: "system", content: SYS }, { role: "user", content: bigTurn }, { role: "assistant", content: "ok" }, { role: "user", content: "再来一句" }])
+  const t2 = sent[sent.length - 1]
+  assert.ok(t2.text.includes("<instructions>"), "T2 must resend the instructions the thread never received inline")
+  assert.ok(t2.text.includes("HEAL-HEAD"), "T2 carries the system text itself")
+
+  // Once the thread actually holds the text inline, later resumes must go back
+  // to plain incremental turns. A smaller prompt is used here because the huge
+  // one above can never fit in a single frame, so it would legitimately keep
+  // being re-sent every turn.
+  const SMALL = "HEAL-HEAD 【人设：红白】" + pad(120) + " HEAL-TAIL"
+  const runSmall = (msgs) => {
+    sent.length = 0
+    return executeSncsChat(acct, { model: "balanced", stream: false, messages: msgs }, {
+      WebSocket: WS,
+      threadStore: store,
+      stateful: true,
+      disableAttachments: false,
+      uploadAttachment: uploader,
+    })
+  }
+  await runSmall([{ role: "system", content: SMALL }, { role: "user", content: "第一句" }])
+  const fresh = sent[sent.length - 1]
+  assert.ok(fresh.text.includes("HEAL-HEAD"), "a fresh thread carries the prompt inline")
+  await runSmall([
+    { role: "system", content: SMALL },
+    { role: "user", content: "第一句" },
+    { role: "assistant", content: "ok" },
+    { role: "user", content: "第二句" },
+  ])
+  const repaired = sent[sent.length - 1]
+  assert.ok(!repaired.text.includes("<instructions>"), "an inline-delivered thread must not resend on every turn")
+  assert.ok(!repaired.text.includes("<system_context_update>"), "and must not emit an empty diff either")
+})
+
+test("a failed system-attachment upload drops the pointer instead of naming a missing file", async () => {
+  const sent = []
+  const WS = makeMockWebSocketClass((ws) => {
+    ws.readyState = 1
+    ws.onopen?.()
+    queueMicrotask(() => {
+      for (const raw of ws.sent) {
+        const outer = JSON.parse(Buffer.from(raw).toString("utf8"))
+        const inner = JSON.parse(Buffer.from(outer.payload.payload, "base64").toString("utf8"))
+        if (inner.type === "user_message") sent.push(inner.payload)
+      }
+      ws.emitAidpEvent({ type: "session_established", payload: {} })
+      ws.emitAidpEvent({ type: "text_delta", payload: { delta: "ok" } })
+      ws.emitAidpEvent({ type: "message_complete", payload: {} })
+    })
+  })
+  const pad = (n) => "（性格补充）。".repeat(n)
+  const SYS = "SYS-HEAD 【人设】" + pad(4000) + " SYS-TAIL"
+  const failingUploader = async (_a, file) => {
+    if (file.name === "system_instructions.txt") throw new Error("DLP blocked")
+    return {
+      type: "file",
+      name: file.name,
+      size: file.bytes.byteLength,
+      mimeType: file.mimeType,
+      path: `/workspace/attached_files/${file.name}`,
+      attachmentId: "att-ok",
+      contentSha256: "sha-ok",
+    }
+  }
+  const acct = { providerType: "social", access: "tok-nofile", tenantUrl: "https://qbs-nofile.plato.ai.aws.dev", accountId: "nofile" }
+  await executeSncsChat(acct, { model: "balanced", stream: false, messages: [{ role: "system", content: SYS }, { role: "user", content: "hi" }] }, {
+    WebSocket: WS,
+    threadStore: createThreadStore(),
+    stateful: true,
+    disableAttachments: false,
+    uploadAttachment: failingUploader,
+  })
+  const frame = sent[sent.length - 1]
+  assert.deepEqual(frame.attachments || [], [], "the failed file must not be advertised")
+  assert.ok(!/system_instructions\.txt/.test(frame.text), "no pointer may survive a failed upload")
+  assert.ok(frame.text.includes("SYS-HEAD"), "the anchor still gives the model its persona")
+})
