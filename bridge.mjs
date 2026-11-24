@@ -19,6 +19,16 @@ export const DEFAULT_CONTEXT_LIMIT = 1_000_000
 export const DEFAULT_OUTPUT_LIMIT = 64_000
 
 const EFFORT_LEVELS = ["off", "low", "medium", "high", "max"]
+const EFFORT_ALIASES = new Map([
+  ["none", "off"],
+  ["disabled", "off"],
+  ["false", "off"],
+  ["minimal", "low"],
+  ["med", "medium"],
+  ["xhigh", "max"],
+  ["enabled", "high"],
+  ["true", "high"],
+])
 
 export const DEFAULT_MODELS = {
   auto: {
@@ -193,10 +203,11 @@ export function modelsFromSettings(providerID, settings, baseURL = DEFAULT_API_U
 }
 
 /**
- * Map an OpenAI-style `model` id (including `amazon-quick-plus/...` prefix or `@effort` suffix)
- * and body reasoning hints into SNCS `{ modelId, agentMode, autoRouting, thinkingEffort }`.
+ * Map an OpenAI-style `model` id (including `amazon-quick-plus/...` prefix or `@effort` suffix),
+ * Magpie's X-Magpie-Effort header and body reasoning hints into SNCS
+ * `{ modelId, agentMode, autoRouting, thinkingEffort }`.
  */
-export function resolveModelAndEffort(requestedModel, body = {}) {
+export function resolveModelAndEffort(requestedModel, body = {}, effortHeader = "") {
   let raw = String(requestedModel || "balanced").trim()
   if (raw.includes("/")) raw = raw.split("/").pop()
   raw = raw.replace(/\[[^\]]+\]/g, "").trim()
@@ -216,13 +227,21 @@ export function resolveModelAndEffort(requestedModel, body = {}) {
     defaultEffort: canonical === "advanced" ? "medium" : "off",
   }
 
-  let requestedEffort =
-    atEffort ||
-    String(
-      body?.reasoning_effort ??
-        body?.reasoning?.effort ??
-        (body?.thinking?.type === "disabled" ? "off" : body?.thinking?.effort ?? ""),
-    ).toLowerCase()
+  // Magpie tells a plugin the effort its variant picker asked in
+  // X-Magpie-Effort; the body is what the client itself said. The header
+  // wins, as the picker's choice is the one the user made.
+  const rawEffort = String(
+    effortHeader ||
+      atEffort ||
+      (body?.reasoning === false || body?.thinking?.type === "disabled" ? "off" : "") ||
+      body?.reasoning_effort ||
+      body?.reasoning?.effort ||
+      body?.thinking?.effort ||
+      "",
+  )
+    .trim()
+    .toLowerCase()
+  let requestedEffort = EFFORT_ALIASES.get(rawEffort) ?? rawEffort
 
   if (!spec.reasoning) {
     requestedEffort = "off"
@@ -1063,7 +1082,7 @@ export const DEFAULT_THREAD_STORE = createThreadStore()
  * compacting schemas and older turns when necessary so the outbound SNCS frame stays under the 64 KB limit.
  */
 export function openaiToSncsRequest(body, opts = {}) {
-  const { modelId, agentMode, autoRouting, thinkingEffort } = resolveModelAndEffort(body?.model, body)
+  const { modelId, agentMode, autoRouting, thinkingEffort } = resolveModelAndEffort(body?.model, body, opts.effortHeader)
   const messages = Array.isArray(body?.messages) ? body.messages : []
   const rawSystemParts = []
   const convoMessages = []

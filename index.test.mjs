@@ -329,6 +329,14 @@ test("model mapping, tool-call splitter, and openaiToSncsRequest handle variants
     autoRouting: false,
     thinkingEffort: "medium",
   })
+  // Magpie's variant picker sends the effort in X-Magpie-Effort; the header
+  // wins over the body, and the relay spellings map to Quick's levels
+  assert.equal(resolveModelAndEffort("balanced", {}, "high").thinkingEffort, "high")
+  assert.equal(resolveModelAndEffort("balanced", { reasoning_effort: "low" }, "max").thinkingEffort, "max")
+  assert.equal(resolveModelAndEffort("balanced", { reasoning_effort: "xhigh" }).thinkingEffort, "max")
+  assert.equal(resolveModelAndEffort("balanced", { reasoning_effort: "minimal" }).thinkingEffort, "low")
+  assert.equal(resolveModelAndEffort("balanced", { reasoning_effort: "none" }).thinkingEffort, "off")
+  assert.equal(resolveModelAndEffort("balanced", { reasoning: false }).thinkingEffort, "off")
 
   // OpenAI -> SNCS multi-turn + tools
   const sncs = openaiToSncsRequest({
@@ -345,6 +353,12 @@ test("model mapping, tool-call splitter, and openaiToSncsRequest handle variants
   })
   assert.equal(sncs.userMessagePayload.agent_mode, "smart")
   assert.equal(sncs.userMessagePayload.thinking_effort, "medium")
+
+  const sncsEffort = openaiToSncsRequest(
+    { model: "smart", reasoning_effort: "low", stream: true, messages: [{ role: "user", content: "Hi" }] },
+    { effortHeader: "max" },
+  )
+  assert.equal(sncsEffort.userMessagePayload.thinking_effort, "max")
   assert.equal(sncs.userMessagePayload.incognito, true)
   assert.equal(sncs.userMessagePayload.web_search_enabled, true)
   assert.equal(sncs.sessionConnectPayload.outpostId, undefined)

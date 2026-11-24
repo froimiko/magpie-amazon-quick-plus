@@ -294,10 +294,11 @@ export function createAmazonQuickPlugin(deps = {}) {
 
               const headers = new Headers(init?.headers ?? req?.headers)
               const sessionId = headers.get(SESSION_HEADER) || ""
+              const effortHeader = headers.get("x-magpie-effort") || ""
               const signal = init?.signal ?? req?.signal
 
               try {
-                const res = await runExecuteSncsChat(a, body, { ...deps, sessionId, signal })
+                const res = await runExecuteSncsChat(a, body, { ...deps, sessionId, signal, effortHeader })
                 return withSignInHeader(res, renewed ? "renewed" : "kept")
               } catch (err) {
                 if (err?.status !== 401) {
@@ -311,7 +312,7 @@ export function createAmazonQuickPlugin(deps = {}) {
                 if (!r.a) return signedOutResponse(a, r.why, isGone(a, r, err.invalidToken))
                 a = r.a
                 try {
-                  const res2 = await runExecuteSncsChat(a, body, { ...deps, sessionId, signal })
+                  const res2 = await runExecuteSncsChat(a, body, { ...deps, sessionId, signal, effortHeader })
                   return withSignInHeader(res2, "renewed")
                 } catch (err2) {
                   if (err2?.status === 401) {
