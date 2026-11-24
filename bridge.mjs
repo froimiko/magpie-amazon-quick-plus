@@ -13,6 +13,7 @@ import {
   surfaceTypeForPlatform,
   uploadQuickAttachment,
 } from "./credentials.mjs"
+import { agentModeEnabled, ensureCarrierAgent } from "./agents.mjs"
 
 export const DEFAULT_API_URL = "https://quick.aws.com/v1"
 export const DEFAULT_CONTEXT_LIMIT = 1_000_000
@@ -328,11 +329,27 @@ async function resolveImageBytes(urlStr, fetchImpl, signal) {
 export const MAX_USER_MESSAGE_FRAME_BYTES = 62_000
 const OVERFLOW_ATTACHMENT_RESERVE_BYTES = 800
 
+const WEB_SEARCH_ENV = "MAGPIE_QUICK_WEB_SEARCH"
+
+/**
+ * Default for `web_search_enabled` when the request body does not state one.
+ *
+ * Quick's own cloud search answers before the caller's tool chain can, so an
+ * operator may want it off for every turn instead of per request. The body (and
+ * `opts.webSearchEnabled`) always wins; this only supplies the fallback via the
+ * `MAGPIE_QUICK_WEB_SEARCH` env switch, defaulting to on like the desktop app.
+ */
+export function webSearchDefaultEnabled() {
+  const raw = String(process.env?.[WEB_SEARCH_ENV] ?? "").trim().toLowerCase()
+  if (!raw) return true
+  return !["0", "off", "no", "false", "disabled", "disable", "none"].includes(raw)
+}
+
 function buildOverflowAttachmentNote(attachmentName, droppedRange = null) {
   const droppedPart = droppedRange
     ? ` Omitted earlier history is in lines ${droppedRange.startLine}-${droppedRange.endLine}.`
     : ""
-  return `[Note: Full untruncated content is attached in your Quick workspace at /workspace/attached_files/${attachmentName}.${droppedPart} Exception to the no-container-tools rule: use your built-in workspace file reader to read this attachment directly instead of re-reading those lines via local <tool_call>.]`
+  return `[Note: Full untruncated content is attached in your Quick workspace at /workspace/attached_files/${attachmentName} (workspace-relative path: attached_files/${attachmentName}).${droppedPart} Exception to the no-container-tools rule: use your built-in workspace file reader to read this attachment directly instead of re-reading those lines via local <tool_call>.]`
 }
 
 function snapHeadToLineBoundary(s, targetHead) {
@@ -1139,7 +1156,7 @@ export function openaiToSncsRequest(body, opts = {}) {
       ? body.web_search_enabled
       : typeof opts.webSearchEnabled === "boolean"
         ? opts.webSearchEnabled
-        : true
+        : webSearchDefaultEnabled()
   const surfaceType = surfaceTypeForPlatform(opts.platform)
   const maxFrameBytes = Number(opts.maxFrameBytes) > 0 ? Number(opts.maxFrameBytes) : MAX_USER_MESSAGE_FRAME_BYTES
 
@@ -1173,6 +1190,10 @@ export function openaiToSncsRequest(body, opts = {}) {
     ? buildBridgeCustomPrompt(tools, opts.customPrompt || "", lang)
     : opts.customPrompt || null
 
+  // Carrier draft agent: when the channel is available the account's neutral
+  // draft agent answers, so the caller's system text still reaches the agent
+  // instruction layer. "" / null keeps the plain inline path.
+  const carrierAgentId = String(opts.chatAgentId ?? "").trim()
   const buildUserPayload = (textVal) => ({
     traceId: randomUUID(),
     text: textVal,
@@ -1186,7 +1207,10 @@ export function openaiToSncsRequest(body, opts = {}) {
     user_timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
     user_locale: opts.locale || Intl.DateTimeFormat().resolvedOptions().locale || "en-US",
     custom_prompt: customPrompt,
-    chat_agent_id: null,
+    chat_agent_id: carrierAgentId || null,
+    // Only sent alongside a real agent id, so a carrier-off turn keeps the exact
+    // frame shape it had before this channel existed.
+    ...(carrierAgentId ? { use_draft: true } : {}),
     auto_routing: autoRouting,
     web_search_enabled: webSearchEnabled,
     incognito: true,
@@ -1840,6 +1864,15 @@ export async function executeSncsChat(a, openaiBody, opts = {}) {
   const stateful = opts.stateful !== false && !opts.disableResume && !opts.threadId && !!threadStore
   const accountKey = accountKeyOf(a)
 
+  // Resolve (once per account) the neutral draft agent that carries the turn's
+  // instructions into Quick's agent layer. Any failure yields "" and the turn
+  // continues on the plain inline <instructions> path.
+  let chatAgentId = String(opts.chatAgentId ?? "").trim()
+  if (!chatAgentId && agentModeEnabled(opts)) {
+    chatAgentId = await ensureCarrierAgent(a, { ...opts, accountKey })
+  }
+  const turnOpts = chatAgentId ? { ...opts, chatAgentId } : opts
+
   let resumeState = null
   let releaseInflight = null
 
@@ -1869,7 +1902,7 @@ export async function executeSncsChat(a, openaiBody, opts = {}) {
     // nor overwrite the main thread's cache entries.
     if (!hasTools && threadStore.hasToolThread?.(accountKey, sessionId, convo)) {
       return await runSncsTurn(a, openaiBody, {
-        ...opts,
+        ...turnOpts,
         stateful: false,
         resumeState: null,
         threadStore: null,
@@ -1893,7 +1926,7 @@ export async function executeSncsChat(a, openaiBody, opts = {}) {
 
   try {
     return await runSncsTurn(a, openaiBody, {
-      ...opts,
+      ...turnOpts,
       resumeState,
       accountKey,
       threadStore,
@@ -1907,7 +1940,7 @@ export async function executeSncsChat(a, openaiBody, opts = {}) {
     }
     releaseInflight?.()
     if (canRetryFresh) {
-      return await runSncsTurn(a, openaiBody, { ...opts, resumeState: null, accountKey, threadStore, WS })
+      return await runSncsTurn(a, openaiBody, { ...turnOpts, resumeState: null, accountKey, threadStore, WS })
     }
     throw err
   }

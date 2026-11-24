@@ -13,6 +13,7 @@ import {
   usageFromProfile,
 } from "./credentials.mjs"
 import { configModels, DEFAULT_API_URL, executeSncsChat, modelsFromSettings } from "./bridge.mjs"
+import { agentMode } from "./agents.mjs"
 
 export const PROVIDER_ID = "amazon-quick-plus"
 export const PROVIDER_NAME = "Amazon Quick Plus"
@@ -106,6 +107,11 @@ export function createAmazonQuickPlugin(deps = {}) {
   const runFetchQuickSettings = deps.fetchQuickSettings ?? fetchQuickSettings
   const runExecuteSncsChat = deps.executeSncsChat ?? executeSncsChat
   const authDeps = { ...deps, providerId: PROVIDER_ID }
+  // A relayed system message only reaches Quick's agent instruction layer
+  // through a draft agent, so the plugin asks for carrier mode by default;
+  // MAGPIE_QUICK_AGENT_MODE=off (or a deps.agentMode override) turns it off and
+  // the bridge falls back to the inline <instructions> path.
+  const turnDeps = { ...deps, agentMode: agentMode({ ...deps, defaultMode: "carrier" }) }
 
   return async function AmazonQuickAuthPlugin(ctx = {}) {
     const client = ctx?.client
@@ -298,7 +304,7 @@ export function createAmazonQuickPlugin(deps = {}) {
               const signal = init?.signal ?? req?.signal
 
               try {
-                const res = await runExecuteSncsChat(a, body, { ...deps, sessionId, signal, effortHeader })
+                const res = await runExecuteSncsChat(a, body, { ...turnDeps, sessionId, signal, effortHeader })
                 return withSignInHeader(res, renewed ? "renewed" : "kept")
               } catch (err) {
                 if (err?.status !== 401) {
@@ -312,7 +318,7 @@ export function createAmazonQuickPlugin(deps = {}) {
                 if (!r.a) return signedOutResponse(a, r.why, isGone(a, r, err.invalidToken))
                 a = r.a
                 try {
-                  const res2 = await runExecuteSncsChat(a, body, { ...deps, sessionId, signal, effortHeader })
+                  const res2 = await runExecuteSncsChat(a, body, { ...turnDeps, sessionId, signal, effortHeader })
                   return withSignInHeader(res2, "renewed")
                 } catch (err2) {
                   if (err2?.status === 401) {

@@ -42,7 +42,15 @@ import {
   openaiToSncsRequest,
   resolveModelAndEffort,
   stripReasoningEnabled,
+  webSearchDefaultEnabled,
 } from "./bridge.mjs"
+import {
+  agentAccountKey,
+  agentMode,
+  CARRIER_AGENT_INSTRUCTIONS,
+  createAgentStore,
+  ensureCarrierAgent,
+} from "./agents.mjs"
 import { createAmazonQuickPlugin } from "./index.mjs"
 import * as opencode1 from "./opencode.mjs"
 import opencode2 from "./opencode2.mjs"
@@ -793,6 +801,9 @@ test("AmazonQuickAuthPlugin executes SSE streaming, 401 token retry, usage, and 
     const desktopRejectFactory = createAmazonQuickPlugin({
       dir: dir401,
       WebSocket: RejectWS,
+      // Keeps the turn hermetic: carrier mode resolves a draft agent over HTTP
+      // before the socket opens, and a test must never reach the network.
+      fetch: async () => new Response(JSON.stringify({ error: "unsupported" }), { status: 400 }),
       readKeyring: () =>
         JSON.stringify({
           access_token: "desk-bad",
@@ -2583,4 +2594,230 @@ test("browserSignIn without local profiles.json runs 2-hop quick.aws.com/sn disc
   assert.equal(res.awsAccountId, "123456789012")
   assert.equal(res.accountId, "tester@example.com")
   assert.equal(tokBody.code, "disc-auth-code")
+})
+
+function decodeAidpPayloads(ws) {
+  const out = []
+  for (const raw of ws.sent) {
+    const outer = JSON.parse(Buffer.from(raw).toString("utf8"))
+    const inner = JSON.parse(Buffer.from(outer.payload.payload, "base64").toString("utf8"))
+    out.push(inner)
+  }
+  return out
+}
+
+// Answers /api/ws-rpc the way the data plane does: a nested invokeAgent envelope
+// whose frames come back as a JSON string inside body.
+function makeAgentRpcFetch({ draftId = "agent-draft-1", failCreate = false, failUpdate = false } = {}) {
+  const calls = []
+  const respond = (frames) =>
+    new Response(
+      JSON.stringify({
+        eventResponse: {
+          invokeAgentResponse: JSON.stringify({ statusCode: 200, body: JSON.stringify({ frames }) }),
+        },
+      }),
+      { status: 200 },
+    )
+  const fetchImpl = async (_url, init) => {
+    const body = init?.body ? JSON.parse(init.body) : {}
+    const inner = body?.eventBody?.invokeAgent?.body ?? {}
+    calls.push({ kind: inner?.type, payload: inner?.payload })
+    if (inner?.type === "create_agent_draft") {
+      if (failCreate) return new Response(JSON.stringify({ errorMessage: "agent service unavailable" }), { status: 200 })
+      return respond([{ type: "agent_draft_created", payload: { agent_id: draftId } }])
+    }
+    if (inner?.type === "update_chat_agent_config") {
+      if (failUpdate) return new Response(JSON.stringify({ errorMessage: "instructions rejected" }), { status: 200 })
+      return respond([{ type: "agent_config_updated", payload: { agent_id: inner?.payload?.agent_id } }])
+    }
+    return new Response("{}", { status: 404 })
+  }
+  return { fetchImpl, calls }
+}
+
+test("carrier draft agent is created once per account and turns carry chat_agent_id + use_draft", async () => {
+  assert.equal(agentMode({}), "off")
+  assert.equal(agentMode({ defaultMode: "carrier" }), "carrier")
+  assert.equal(agentMode({ agentMode: "off", defaultMode: "carrier" }), "off")
+
+  const acct = { providerType: "social", access: "tok-agent", tenantUrl: "https://qbs-agent.plato.ai.aws.dev", accountId: "agent-acct" }
+  const { fetchImpl, calls } = makeAgentRpcFetch({ draftId: "agent-draft-abc" })
+  const agentStore = createAgentStore()
+  const sent = []
+  const MockWS = makeMockWebSocketClass((ws) => {
+    ws.readyState = 1
+    ws.onopen?.()
+    queueMicrotask(() => {
+      sent.push(decodeAidpPayloads(ws))
+      ws.emitAidpEvent({ type: "session_established", payload: {} })
+      ws.emitAidpEvent({ type: "text_delta", payload: { delta: "carrier reply" } })
+      ws.emitAidpEvent({ type: "message_complete", payload: {} })
+    })
+  })
+  const runTurn = () =>
+    executeSncsChat(
+      acct,
+      { model: "fast", stream: false, messages: [{ role: "system", content: "Answer only in Japanese." }, { role: "user", content: "Hello" }] },
+      { WebSocket: MockWS, fetch: fetchImpl, agentMode: "carrier", agentStore, stateful: false },
+    )
+
+  const first = await (await runTurn()).json()
+  assert.equal(first.choices[0].message.content, "carrier reply")
+  const firstMsg = sent[0].find((f) => f.type === "user_message").payload
+  assert.equal(firstMsg.chat_agent_id, "agent-draft-abc")
+  assert.equal(firstMsg.use_draft, true)
+  // the caller's system text still rides inline, so nothing is lost on downgrade
+  assert.ok(firstMsg.text.includes("Answer only in Japanese."))
+
+  const created = calls.filter((c) => c.kind === "create_agent_draft")
+  const updated = calls.filter((c) => c.kind === "update_chat_agent_config")
+  assert.equal(created.length, 1)
+  assert.deepEqual(created[0].payload, { new_agent: true })
+  assert.equal(updated.length, 1)
+  assert.equal(updated[0].payload.agent_id, "agent-draft-abc")
+  assert.equal(updated[0].payload.target, "draft")
+  assert.equal(updated[0].payload.instructions, CARRIER_AGENT_INSTRUCTIONS)
+  assert.ok(!/ignore (the )?backend|override|jailbreak|bypass/i.test(CARRIER_AGENT_INSTRUCTIONS), "carrier instructions must stay neutral")
+
+  // Second turn on the same account reuses the cached draft agent.
+  await runTurn()
+  const secondMsg = sent[1].find((f) => f.type === "user_message").payload
+  assert.equal(secondMsg.chat_agent_id, "agent-draft-abc")
+  assert.equal(secondMsg.use_draft, true)
+  assert.equal(calls.filter((c) => c.kind === "create_agent_draft").length, 1)
+
+  // A concurrent burst on a cold cache creates exactly one draft agent.
+  const burstStore = createAgentStore()
+  const burst = makeAgentRpcFetch({ draftId: "agent-draft-burst" })
+  const results = await Promise.all(
+    Array.from({ length: 5 }, () =>
+      ensureCarrierAgent({ ...acct, accountId: "burst-acct" }, { agentMode: "carrier", agentStore: burstStore, fetch: burst.fetchImpl }),
+    ),
+  )
+  assert.deepEqual(results, Array(5).fill("agent-draft-burst"))
+  assert.equal(burst.calls.filter((c) => c.kind === "create_agent_draft").length, 1)
+  assert.equal(agentAccountKey(acct), "https://qbs-agent.plato.ai.aws.dev||agent-acct")
+})
+
+test("draft agent failures degrade smoothly to chat_agent_id null without blocking the turn", async () => {
+  const acct = { providerType: "social", access: "tok-fail", tenantUrl: "https://qbs-fail.plato.ai.aws.dev", accountId: "fail-acct" }
+  const sent = []
+  const MockWS = makeMockWebSocketClass((ws) => {
+    ws.readyState = 1
+    ws.onopen?.()
+    queueMicrotask(() => {
+      sent.push(decodeAidpPayloads(ws))
+      ws.emitAidpEvent({ type: "session_established", payload: {} })
+      ws.emitAidpEvent({ type: "text_delta", payload: { delta: "inline path reply" } })
+      ws.emitAidpEvent({ type: "message_complete", payload: {} })
+    })
+  })
+
+  for (const mode of ["create", "update", "throw"]) {
+    sent.length = 0
+    const agentStore = createAgentStore()
+    const opts = { WebSocket: MockWS, agentMode: "carrier", agentStore, stateful: false }
+    if (mode === "create") opts.fetch = makeAgentRpcFetch({ failCreate: true }).fetchImpl
+    else if (mode === "update") opts.fetch = makeAgentRpcFetch({ failUpdate: true }).fetchImpl
+    else
+      opts.fetch = async () => {
+        throw new Error("network down")
+      }
+    const res = await executeSncsChat(
+      acct,
+      { model: "fast", stream: false, messages: [{ role: "system", content: "SYSTEM_STAYS_INLINE" }, { role: "user", content: "Hi" }] },
+      opts,
+    )
+    const json = await res.json()
+    assert.equal(json.choices[0].message.content, "inline path reply", "turn must still complete when the draft channel fails")
+    const msg = sent[0].find((f) => f.type === "user_message").payload
+    assert.equal(msg.chat_agent_id, null, "must fall back to the null agent id")
+    assert.equal("use_draft" in msg, false, "the downgraded frame keeps its original shape")
+    assert.ok(msg.text.includes("<instructions>"))
+    assert.ok(msg.text.includes("SYSTEM_STAYS_INLINE"))
+    assert.equal(agentStore.failed(agentAccountKey(acct)), true, "failures are negatively cached")
+  }
+
+  // An explicitly supplied agent id skips the channel entirely.
+  const passthrough = []
+  const PassWS = makeMockWebSocketClass((ws) => {
+    ws.readyState = 1
+    ws.onopen?.()
+    queueMicrotask(() => {
+      passthrough.push(decodeAidpPayloads(ws))
+      ws.emitAidpEvent({ type: "session_established", payload: {} })
+      ws.emitAidpEvent({ type: "text_delta", payload: { delta: "explicit" } })
+      ws.emitAidpEvent({ type: "message_complete", payload: {} })
+    })
+  })
+  const rpc = makeAgentRpcFetch()
+  await executeSncsChat(
+    acct,
+    { model: "fast", stream: false, messages: [{ role: "user", content: "Hi" }] },
+    { WebSocket: PassWS, fetch: rpc.fetchImpl, agentMode: "carrier", chatAgentId: "agent-explicit", stateful: false },
+  )
+  const passMsg = passthrough[0].find((f) => f.type === "user_message").payload
+  assert.equal(passMsg.chat_agent_id, "agent-explicit")
+  assert.equal(passMsg.use_draft, true)
+  assert.equal(rpc.calls.length, 0, "an explicit agent id must not create a draft")
+
+  // A 401 from the draft channel is the caller's sign-in problem, not a channel
+  // verdict: it must not be negatively cached, so the retry after re-sign-in
+  // still reaches the draft agent.
+  const authStore = createAgentStore()
+  const authAcct = { ...acct, accountId: "auth-acct" }
+  const unauth = await ensureCarrierAgent(authAcct, {
+    agentMode: "carrier",
+    agentStore: authStore,
+    fetch: async () => {
+      const err = new Error("Amazon Quick rejected authentication (401)")
+      err.status = 401
+      err.invalidToken = true
+      throw err
+    },
+  })
+  assert.equal(unauth, "")
+  assert.equal(authStore.failed(agentAccountKey(authAcct)), false, "a 401 must not poison the account cache")
+
+  // Carrier off leaves the legacy frame untouched.
+  const plain = openaiToSncsRequest({ model: "fast", messages: [{ role: "user", content: "Hi" }] })
+  assert.equal(plain.userMessagePayload.chat_agent_id, null)
+  assert.equal("use_draft" in plain.userMessagePayload, false)
+})
+
+test("MAGPIE_QUICK_WEB_SEARCH controls the default web_search_enabled value", () => {
+  const prev = process.env.MAGPIE_QUICK_WEB_SEARCH
+  const request = (body = {}) => openaiToSncsRequest({ model: "fast", messages: [{ role: "user", content: "Ping" }], ...body })
+  try {
+    // Unset: desktop parity, search on
+    delete process.env.MAGPIE_QUICK_WEB_SEARCH
+    assert.equal(webSearchDefaultEnabled(), true)
+    assert.equal(request().userMessagePayload.web_search_enabled, true)
+
+    // Every off spelling reaches the frame default
+    for (const off of ["false", "0", "off", "no", "disabled", "none"]) {
+      process.env.MAGPIE_QUICK_WEB_SEARCH = off
+      assert.equal(webSearchDefaultEnabled(), false)
+      assert.equal(request().userMessagePayload.web_search_enabled, false)
+    }
+
+    // A body field wins over the env switch, in both directions
+    process.env.MAGPIE_QUICK_WEB_SEARCH = "false"
+    assert.equal(request({ web_search_enabled: true }).userMessagePayload.web_search_enabled, true)
+    process.env.MAGPIE_QUICK_WEB_SEARCH = "true"
+    assert.equal(request({ web_search_enabled: false }).userMessagePayload.web_search_enabled, false)
+
+    // Explicit opts beat the env switch too
+    process.env.MAGPIE_QUICK_WEB_SEARCH = "false"
+    assert.equal(
+      openaiToSncsRequest({ model: "fast", messages: [{ role: "user", content: "Ping" }] }, { webSearchEnabled: true })
+        .userMessagePayload.web_search_enabled,
+      true,
+    )
+    assert.equal(webSearchDefaultEnabled(), false)
+  } finally {
+    if (prev === undefined) delete process.env.MAGPIE_QUICK_WEB_SEARCH
+    else process.env.MAGPIE_QUICK_WEB_SEARCH = prev
+  }
 })
