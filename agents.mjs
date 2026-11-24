@@ -1,4 +1,7 @@
-import { invokeQbsApi } from "./credentials.mjs"
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs"
+import { dirname, join } from "node:path"
+
+import { invokeQbsApi, quickworkDir } from "./credentials.mjs"
 
 /**
  * Amazon Quick "Draft Agent" carrier channel.
@@ -74,26 +77,94 @@ export function agentAccountKey(a) {
   return `${a?.tenantUrl || ""}|${a?.awsAccountId || ""}|${a?.accountId || ""}`
 }
 
-export const DEFAULT_AGENT_TTL_MS = 6 * 3600_000
+/**
+ * Successful agents are reused until they actually fail: a draft agent costs a
+ * slot against the account's `max_custom_agents` quota, so re-creating one on a
+ * timer (or on every process restart) leaks quota until the account is full.
+ * Only failures expire, so an unsupported surface is not retried on every turn.
+ */
 export const DEFAULT_AGENT_FAILURE_TTL_MS = 10 * 60_000
 const AGENT_CACHE_MAX = 64
 
+/** Env override for the on-disk cache path. */
+export const AGENT_CACHE_FILE_ENV = "MAGPIE_QUICK_AGENT_CACHE_FILE"
+export const AGENT_CACHE_FILE_NAME = "carrier-agents.json"
+
 /**
- * Bounded LRU of `accountKey -> agentId`.
+ * Where the carrier agent ids live between runs: inside the QuickWork config dir
+ * by default, next to the desktop sign-in data the plugin already reads.
+ */
+export function agentCachePath(env = process.env) {
+  const override = String(env?.[AGENT_CACHE_FILE_ENV] ?? "").trim()
+  if (override) return override
+  return join(quickworkDir(env), AGENT_CACHE_FILE_NAME)
+}
+
+/**
+ * Bounded LRU of `accountKey -> agentId`, optionally backed by a JSON file.
  *
- * Successes live for `ttlMs`; failures are remembered for `failureTtlMs` so an
- * unsupported surface (or a hard-down endpoint) is not retried on every turn.
+ * Successes never expire: they are dropped only when the agent actually fails
+ * (see `forget`). Failures are remembered for `failureTtlMs` so an unsupported
+ * surface (or a hard-down endpoint) is not retried on every turn; failures are
+ * never written to disk, so a restart retries the channel once.
+ *
  * `resolve()` de-duplicates concurrent first turns on the same account, so a
- * burst of parallel requests creates exactly one draft agent instead of
- * burning the account's `max_custom_agents` quota.
+ * burst of parallel requests creates exactly one draft agent instead of burning
+ * the account's `max_custom_agents` quota.
+ *
+ * `cacheFile` persists only successful ids, and every read/write error is
+ * swallowed: a broken or unwritable cache must degrade to in-memory behaviour,
+ * never break a chat turn.
  */
 export function createAgentStore({
-  ttlMs = DEFAULT_AGENT_TTL_MS,
   failureTtlMs = DEFAULT_AGENT_FAILURE_TTL_MS,
   max = AGENT_CACHE_MAX,
+  cacheFile = "",
 } = {}) {
   const entries = new Map()
   const inflight = new Map()
+  const persistent = Boolean(cacheFile)
+
+  const loadFromDisk = () => {
+    if (!persistent) return
+    let raw
+    try {
+      raw = readFileSync(cacheFile, "utf8")
+    } catch {
+      return
+    }
+    let doc
+    try {
+      doc = JSON.parse(raw)
+    } catch {
+      return
+    }
+    const agents = doc?.agents && typeof doc.agents === "object" ? doc.agents : {}
+    for (const [key, value] of Object.entries(agents)) {
+      const agentId = typeof value === "string" ? value : String(value?.agentId || "")
+      if (!key || !agentId) continue
+      // Successes carry no expiry: they stay valid until the channel fails.
+      entries.set(key, { agentId, at: Number(value?.at) || 0, ttl: Infinity })
+    }
+  }
+
+  const saveToDisk = () => {
+    if (!persistent) return
+    const agents = {}
+    for (const [key, entry] of entries) {
+      if (!entry.agentId) continue
+      agents[key] = { agentId: entry.agentId, at: entry.at }
+    }
+    try {
+      mkdirSync(dirname(cacheFile), { recursive: true })
+      const tmp = `${cacheFile}.tmp`
+      writeFileSync(tmp, `${JSON.stringify({ version: 1, agents }, null, 2)}\n`, { mode: 0o600 })
+      // Atomic replace: a half-written cache must never become the next read.
+      renameSync(tmp, cacheFile)
+    } catch {
+      // Disk trouble must not fail the turn; stay in-memory only.
+    }
+  }
 
   const prune = (now) => {
     for (const [key, entry] of entries) {
@@ -102,9 +173,13 @@ export function createAgentStore({
     while (entries.size > max) {
       const oldest = entries.keys().next()
       if (oldest.done) break
-      entries.delete(oldest.value)
+      const [key, entry] = [oldest.value, entries.get(oldest.value)]
+      entries.delete(key)
+      if (entry?.agentId) saveToDisk()
     }
   }
+
+  loadFromDisk()
 
   const store = {
     get size() {
@@ -132,14 +207,20 @@ export function createAgentStore({
     },
     remember(key, agentId, now = Date.now()) {
       if (!key) return
+      const id = agentId || ""
       entries.delete(key)
-      entries.set(key, { agentId: agentId || "", at: now, ttl: agentId ? ttlMs : failureTtlMs })
+      // Successes are permanent (Infinity); failures expire after failureTtlMs.
+      entries.set(key, { agentId: id, at: now, ttl: id ? Infinity : failureTtlMs })
+      if (id) saveToDisk()
       prune(now)
     },
+    /** Drop a dead agent id from memory AND disk so the next turn rebuilds it. */
     forget(key) {
       if (!key) return
+      const had = Boolean(entries.get(key)?.agentId)
       entries.delete(key)
       inflight.delete(key)
+      if (had) saveToDisk()
     },
     inflightCount() {
       return inflight.size
@@ -171,12 +252,19 @@ export function createAgentStore({
     clear() {
       entries.clear()
       inflight.clear()
+      saveToDisk()
     },
   }
   return store
 }
 
-export const DEFAULT_AGENT_STORE = createAgentStore()
+/**
+ * Process-wide store. It persists to `agentCachePath()` so a plugin restart
+ * reuses the account's existing draft agent instead of spending another slot
+ * from `max_custom_agents`. Tests pass their own `cacheFile` (or
+ * `MAGPIE_QUICK_AGENT_CACHE_FILE`) to stay off the real home directory.
+ */
+export const DEFAULT_AGENT_STORE = createAgentStore({ cacheFile: agentCachePath() })
 
 function isAbortLike(err) {
   const name = String(err?.name ?? "")

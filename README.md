@@ -28,7 +28,8 @@
   - 桌面端凭证基于 `profiles.json` 文件 `mtime` 与 Token 过期时间（支持数字时间戳与 ISO-8601 字符串）智能缓存，避免每轮重复拉起系统凭据进程；Quick 账号配置（`settings`）按账号缓存 2 分钟；浏览器 OAuth 回调服务支持超时自动关闭，防止放弃登录时残留本地端口占用。
 - **Draft Agent 系统指令通道（carrier）**：
   - 调用方的 `system` / `developer` 消息除了内联进 `<instructions>`，还会通过数据平面 `/integration/quick-work/qbs-event` 的 `invokeAgent` 信封走 `api/ws-rpc`：`create_agent_draft` 建草稿拿 `agent_id` → `update_chat_agent_config` 写入中性载体指令；**不发布草稿**（`publish_agent_draft` 会超时），对话时在 `user_message` 里带 `chat_agent_id` + `use_draft: true` 引用它。
-  - 按账号复用**同一个**中性 carrier agent（缓存 6 小时），首轮并发用 in-flight 去重，避免每条消息新建撞上 `max_custom_agents` 配额。载体指令只描述「遵循对话中的 `<instructions>`」，不含任何越狱 / 对抗词。
+  - 按账号复用**同一个**中性 carrier agent：`agentId` 持久化到本地 JSON（默认 `~/.quickwork/carrier-agents.json`），**插件重启后继续复用**，且成功缓存**不会按时间过期**，只有真正失效时才重建；首轮并发用 in-flight 去重。每条消息都新建草稿会逐步耗尽 `max_custom_agents` 配额，这是刻意避免的。载体指令只描述「遵循对话中的 `<instructions>`」，不含任何越狱 / 对抗词。
+  - 草稿若在服务端被清理（或换了登录），该轮会在模型输出前失败；插件随即 `forget` 掉这个失效 id（内存 + 磁盘）并以 `chat_agent_id: null` 自动重试一次，调用方仍能拿到回答。鉴权失败（401/403）与主动取消不触发该降级。
   - 创建或写入失败（含 gateway 不支持、配额已满、网络异常）会在 10 分钟内记负缓存并**平滑降级**回 `chat_agent_id: null` + 内联 `<instructions>`，绝不阻断对话。开关见 `MAGPIE_QUICK_AGENT_MODE`。
 - **动态模型列表与用量查询**：通过 `api/ws-rpc`（`get_settings`）获取账号已启用的模型槽位，并通过 `profile/usage` 查询月度与会话配额窗口及重置时间。
 - **CJK 思维链与工具实参语言对齐**：中文 / 日文 / 韩文工具会话自动在 `custom_prompt` 注入语言一致性约束，避免将日志、报错文案或检索词翻译成英文导致查找失败；亦可通过环境变量隐藏上游 `reasoning_content`。
@@ -88,6 +89,7 @@ https://github.com/yubanmeiqin9048/magpie-amazon-quick-plus
 - `QUICKWORK_DIR` / `AWS_QUICK_DIR`：覆盖默认的 `~/.quickwork` 配置目录路径。
 - `MAGPIE_QUICK_STRIP_REASONING_CONTENT`：设为 `1` / `true` / `yes` / `on` 时不向调用方下发上游 `reasoning_content`（等价于 `executeSncsChat` 的 `stripReasoning: true`，显式传参优先）。
 - `MAGPIE_QUICK_AGENT_MODE`：Draft Agent 通道开关（默认 `carrier`）。设为 `off` / `none` / `0` / `false` 时回到仅内联 `<instructions>` 的方案。
+- `MAGPIE_QUICK_AGENT_CACHE_FILE`：Carrier 草稿 agent 缓存文件路径（默认 `<quickworkDir>/carrier-agents.json`，即通常是 `~/.quickwork/carrier-agents.json`；亦受 `QUICKWORK_DIR` / `AWS_QUICK_DIR` 影响）。只记录创建成功的 `agentId`，失败不落盘；读写异常自动退回纯内存。
 - `MAGPIE_QUICK_WEB_SEARCH`：未显式传 `web_search_enabled` 时的默认值（默认开启，与桌面端一致）。设为 `false` / `0` / `off` / `no` 时默认关闭云端联网，避免抢答调用方自己的工具链；请求体显式传参始终优先。
 
 ## 测试
@@ -125,7 +127,8 @@ Works with **OpenCode 1.x**, **OpenCode 2.x**, and **Magpie** with zero external
   - Reassembles inbound `_chunked_frame` payloads across out-of-order chunks, guards WebSocket connects (`15s`) and response idle stalls (`90s`) with HTTP `504` timeouts, caches desktop credentials against `profiles.json` `mtime` + token expiry (supporting numeric epochs and ISO-8601 strings), caches account settings for 2 minutes, and auto-closes abandoned OAuth loopback listeners.
 - **Draft Agent system-instruction channel (carrier)**:
   - Caller `system` / `developer` messages ride inline in `<instructions>` and, in addition, reach Quick's agent instruction layer through `api/ws-rpc` over the data-plane `/integration/quick-work/qbs-event` `invokeAgent` envelope: `create_agent_draft` returns an `agent_id`, then `update_chat_agent_config` writes the neutral carrier instructions; the draft is **never published** (`publish_agent_draft` outlives the relay timeout), and turns reference it with `chat_agent_id` + `use_draft: true`.
-  - One **shared** neutral carrier agent per account (cached 6 hours) keeps every conversation off the `max_custom_agents` quota; concurrent first turns are de-duplicated by an in-flight promise. The carrier instructions only restate "follow the caller's `<instructions>`" and contain no jailbreak or override phrasing.
+  - One **shared** neutral carrier agent per account keeps every conversation off the `max_custom_agents` quota. Its id is persisted to a small local JSON file (default `~/.quickwork/carrier-agents.json`), so a plugin restart keeps reusing it, and a successful id **never expires on a timer** — it is rebuilt only when it actually fails. Concurrent first turns are de-duplicated by an in-flight promise. The carrier instructions only restate "follow the caller's `<instructions>`" and contain no jailbreak or override phrasing.
+  - If the draft is removed server-side (or the sign-in changed), the turn fails before any model output; the plugin then `forget`s that id (memory and disk) and retries once with `chat_agent_id: null`, so the caller still gets an answer. Auth failures (401/403) and deliberate aborts do not trigger this downgrade.
   - Any failure (unsupported gateway surface, quota exhaustion, network error, missing `agent_id`) is negatively cached for 10 minutes and **degrades smoothly** back to `chat_agent_id: null` plus inline `<instructions>`; a turn is never blocked. Toggle with `MAGPIE_QUICK_AGENT_MODE`.
 - **Dynamic Models & Usage**: Discovers active model slots from `api/ws-rpc` (`get_settings`) and reports monthly & session quota windows from `profile/usage`.
 - **CJK Reasoning & Tool-Argument Alignment**: Automatically appends a language-consistency rule to `custom_prompt` for Chinese / Japanese / Korean tool sessions so log lines, filenames, and search queries stay verbatim rather than being translated into English; optionally strips upstream `reasoning_content` via environment variable.
@@ -184,6 +187,7 @@ When monthly overage (`overage_monthly`) is enabled on an account, it is display
 - `QUICKWORK_DIR` / `AWS_QUICK_DIR`: Override the default `~/.quickwork` profile directory path.
 - `MAGPIE_QUICK_STRIP_REASONING_CONTENT`: Set to `1` / `true` / `yes` / `on` to withhold upstream `reasoning_content` from callers (equivalent to `stripReasoning: true` in `executeSncsChat`; explicit option takes precedence).
 - `MAGPIE_QUICK_AGENT_MODE`: Draft Agent channel switch (default `carrier`). Set to `off` / `none` / `0` / `false` to stay on the inline `<instructions>` path only.
+- `MAGPIE_QUICK_AGENT_CACHE_FILE`: Path of the carrier draft-agent cache (default `<quickworkDir>/carrier-agents.json`, normally `~/.quickwork/carrier-agents.json`; also honours `QUICKWORK_DIR` / `AWS_QUICK_DIR`). Only successfully created `agentId`s are stored, failures are never written, and any read/write error silently falls back to memory.
 - `MAGPIE_QUICK_WEB_SEARCH`: Default for `web_search_enabled` when a request does not set it (on by default, matching the desktop app). Set to `false` / `0` / `off` / `no` to default off so Quick's cloud search cannot answer ahead of the caller's own tool chain; an explicit request field always wins.
 
 ## Tests

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { createHash } from "node:crypto"
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import test from "node:test"
@@ -46,6 +46,7 @@ import {
 } from "./bridge.mjs"
 import {
   agentAccountKey,
+  agentCachePath,
   agentMode,
   CARRIER_AGENT_INSTRUCTIONS,
   createAgentStore,
@@ -3068,4 +3069,141 @@ test("an uploaded system_instructions.txt always has an inline pointer, even nea
     }
   }
   assert.ok(withAttachment > 0, "the sweep must actually produce attachments")
+})
+test("carrier agent ids persist across restarts, survive time, and clear on forget", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "carrier-store-"))
+  const cacheFile = join(dir, "carrier-agents.json")
+  const acct = { providerType: "social", access: "tok", tenantUrl: "https://qbs-persist.plato.ai.aws.dev", accountId: "persist" }
+  const key = agentAccountKey(acct)
+  const rpcReturning = (agentId, counter) => async () => {
+    if (counter) counter.n++
+    const inner = JSON.stringify({
+      statusCode: 200,
+      body: JSON.stringify({ frames: [{ type: "agent_draft_created", payload: { agent_id: agentId } }] }),
+    })
+    return new Response(JSON.stringify({ eventResponse: { invokeAgentResponse: inner } }), { status: 200 })
+  }
+  try {
+    // First run: creates the draft and writes it to disk.
+    const first = createAgentStore({ cacheFile })
+    const created = await ensureCarrierAgent(acct, { agentMode: "carrier", agentStore: first, fetch: rpcReturning("agent-persist-1") })
+    assert.equal(created, "agent-persist-1")
+    const onDisk = JSON.parse(readFileSync(cacheFile, "utf8"))
+    assert.equal(onDisk.agents[key].agentId, "agent-persist-1")
+
+    // Simulated restart: a new store reads the file and reuses the id without
+    // creating another draft (each draft costs a max_custom_agents slot).
+    const counter = { n: 0 }
+    const restarted = createAgentStore({ cacheFile })
+    const reused = await ensureCarrierAgent(acct, {
+      agentMode: "carrier",
+      agentStore: restarted,
+      fetch: rpcReturning("agent-should-not-be-created", counter),
+    })
+    assert.equal(reused, "agent-persist-1")
+    assert.equal(counter.n, 0, "a restart must not create a second draft")
+
+    // No time-based expiry: a success is reused indefinitely.
+    const later = Date.now() + 30 * 24 * 3600_000
+    assert.equal(restarted.peek(key, later), "agent-persist-1")
+
+    // forget clears memory and disk; the next turn rebuilds instead of reusing.
+    restarted.forget(key)
+    assert.equal(restarted.peek(key), "")
+    assert.deepEqual(JSON.parse(readFileSync(cacheFile, "utf8")).agents, {})
+    // A rebuilt id comes from a real create_agent_draft call, not from storage.
+    const again = await ensureCarrierAgent(acct, {
+      agentMode: "carrier",
+      agentStore: restarted,
+      fetch: rpcReturning("agent-persist-2"),
+    })
+    assert.equal(again, "agent-persist-2")
+    assert.equal(JSON.parse(readFileSync(cacheFile, "utf8")).agents[key].agentId, "agent-persist-2")
+
+    // Failures are negative-cached in memory but never written to disk.
+    const failing = createAgentStore({ cacheFile: join(dir, "fail.json") })
+    await ensureCarrierAgent(acct, {
+      agentMode: "carrier",
+      agentStore: failing,
+      fetch: async () => {
+        throw new Error("agent service unavailable")
+      },
+    })
+    assert.equal(failing.failed(key), true)
+    assert.equal(existsSync(join(dir, "fail.json")), false, "a failure must not create a cache file")
+
+    // A corrupt cache file is ignored rather than fatal.
+    writeFileSync(cacheFile, "{ not json")
+    const tolerant = createAgentStore({ cacheFile })
+    assert.equal(tolerant.size, 0)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("a dead cached carrier agent is forgotten and the turn retries on the inline path", async () => {
+  const acct = { providerType: "social", access: "tok-dead", tenantUrl: "https://qbs-dead.plato.ai.aws.dev", accountId: "dead" }
+  const key = agentAccountKey(acct)
+  const sent = []
+  // Upstream rejects any turn that carries a chat_agent_id, answers without one.
+  const WS = makeMockWebSocketClass((ws) => {
+    ws.readyState = 1
+    ws.onopen?.()
+    queueMicrotask(() => {
+      let payload = null
+      for (const raw of ws.sent) {
+        const outer = JSON.parse(Buffer.from(raw).toString("utf8"))
+        const inner = JSON.parse(Buffer.from(outer.payload.payload, "base64").toString("utf8"))
+        if (inner.type === "user_message") payload = inner.payload
+      }
+      sent.push(payload)
+      ws.emitAidpEvent({ type: "session_established", payload: {} })
+      if (payload?.chat_agent_id) {
+        ws.emitAidpEvent({ type: "error", payload: { message: "agent not found", status: 400 } })
+        return
+      }
+      ws.emitAidpEvent({ type: "text_delta", payload: { delta: "inline answer" } })
+      ws.emitAidpEvent({ type: "message_complete", payload: {} })
+    })
+  })
+  const store = createAgentStore({ cacheFile: "" })
+  store.remember(key, "agent-DEAD")
+
+  const res = await executeSncsChat(
+    acct,
+    { model: "fast", stream: false, messages: [{ role: "system", content: "SYS" }, { role: "user", content: "hi" }] },
+    { WebSocket: WS, threadStore: createThreadStore(), stateful: true, agentStore: store, agentMode: "carrier" },
+  )
+  const json = await res.json()
+  assert.equal(json.choices[0].message.content, "inline answer", "the turn must still be answered")
+
+  assert.equal(sent.length, 2, "the dead agent is tried once, then retried without it")
+  assert.equal(sent[0].chat_agent_id, "agent-DEAD")
+  assert.equal(sent[1].chat_agent_id, null, "the retry must not carry the dead id")
+  assert.ok(!("use_draft" in sent[1]), "and must not ask for a draft agent")
+  assert.equal(store.peek(key), "", "the dead id must be forgotten so the next turn rebuilds")
+})
+
+test("a 401 during a carrier turn is not treated as a dead agent", async () => {
+  const acct = { providerType: "social", access: "tok-auth", tenantUrl: "https://qbs-auth.plato.ai.aws.dev", accountId: "auth" }
+  const key = agentAccountKey(acct)
+  const store = createAgentStore({ cacheFile: "" })
+  store.remember(key, "agent-AUTH")
+  let attempts = 0
+  const WS = makeMockWebSocketClass((ws) => {
+    attempts++
+    ws.readyState = 3
+    ws.onerror?.({ message: "401 Unauthorized" })
+    ws.onclose?.({ code: 1008, reason: "401 Unauthorized" })
+  })
+  await assert.rejects(
+    executeSncsChat(
+      acct,
+      { model: "fast", stream: false, messages: [{ role: "user", content: "hi" }] },
+      { WebSocket: WS, threadStore: createThreadStore(), stateful: true, agentStore: store, agentMode: "carrier" },
+    ),
+    (err) => err.status === 401,
+  )
+  assert.equal(store.peek(key), "agent-AUTH", "an auth failure says nothing about the draft agent")
+  assert.equal(attempts, 1, "and must not trigger the agent-downgrade retry")
 })

@@ -13,7 +13,7 @@ import {
   surfaceTypeForPlatform,
   uploadQuickAttachment,
 } from "./credentials.mjs"
-import { agentModeEnabled, ensureCarrierAgent } from "./agents.mjs"
+import { agentModeEnabled, DEFAULT_AGENT_STORE, ensureCarrierAgent } from "./agents.mjs"
 
 export const DEFAULT_API_URL = "https://quick.aws.com/v1"
 export const DEFAULT_CONTEXT_LIMIT = 1_000_000
@@ -2010,6 +2010,7 @@ export async function executeSncsChat(a, openaiBody, opts = {}) {
   // Resolve (once per account) the neutral draft agent that carries the turn's
   // instructions into Quick's agent layer. Any failure yields "" and the turn
   // continues on the plain inline <instructions> path.
+  const agentStore = opts.agentStore === undefined ? DEFAULT_AGENT_STORE : opts.agentStore
   let chatAgentId = String(opts.chatAgentId ?? "").trim()
   if (!chatAgentId && agentModeEnabled(opts)) {
     chatAgentId = await ensureCarrierAgent(a, { ...opts, accountKey })
@@ -2082,6 +2083,28 @@ export async function executeSncsChat(a, openaiBody, opts = {}) {
       threadStore.invalidate(accountKey, opts.sessionId || "", resumeState.threadId)
     }
     releaseInflight?.()
+
+    // A cached draft agent the service no longer has (deleted, quota-cleaned, or
+    // created under a previous sign-in) fails the turn before any model output.
+    // Drop the dead id from memory and disk, then retry once with no agent at all
+    // so the caller still gets an answer on the inline <instructions> path.
+    const authLike = err?.status === 401 || err?.status === 403
+    if (chatAgentId && !authLike && !opts.signal?.aborted) {
+      try {
+        agentStore?.forget?.(accountKey)
+      } catch {}
+      // One retry only: the inline path needs no agent, and a second failure is a
+      // real upstream problem the caller should see.
+      return await runSncsTurn(a, openaiBody, {
+        ...opts,
+        chatAgentId: null,
+        resumeState: null,
+        accountKey,
+        threadStore,
+        WS,
+      })
+    }
+
     if (canRetryFresh) {
       return await runSncsTurn(a, openaiBody, { ...turnOpts, resumeState: null, accountKey, threadStore, WS })
     }
