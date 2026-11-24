@@ -652,6 +652,29 @@ test("AmazonQuickAuthPlugin executes SSE streaming, 401 token retry, usage, and 
   assert.equal(cfg.provider["amazon-quick-plus"].models.fast.reasoning, false)
   assert.deepEqual(cfg.provider["amazon-quick-plus"].models.balanced.modalities.input, ["text", "image"])
 
+  // a config-path list Magpie hands back without capabilities keeps the
+  // plugin's reasoning/vision, while the user's name and limits stand
+  const fallbackModels = await plugin.provider.models(
+    {
+      api: "https://quick.aws.com/v1",
+      models: {
+        balanced: {
+          id: "balanced",
+          name: "Balanced (configured)",
+          limit: { context: 4096 },
+          capabilities: { temperature: true, toolcall: true, input: { text: true }, output: { text: true } },
+          variants: {},
+        },
+      },
+    },
+    {},
+  )
+  assert.equal(fallbackModels.balanced.capabilities.reasoning, true)
+  assert.equal(fallbackModels.balanced.capabilities.input.image, true)
+  assert.deepEqual(fallbackModels.balanced.variants.medium, { reasoningEffort: "medium" })
+  assert.equal(fallbackModels.balanced.name, "Balanced (configured)")
+  assert.equal(fallbackModels.balanced.limit.context, 4096)
+
   // loader SSE stream with 401 refresh recovery (plus Uint8Array body & non-empty baseURL)
   const loader = await plugin.auth.loader(async () => stored)
   assert.equal(loader.baseURL, "https://qbs-test.dp.appintegrations.us-east-1.prod.plato.ai.aws.dev")

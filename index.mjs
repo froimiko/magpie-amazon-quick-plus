@@ -67,6 +67,29 @@ function refusedReason(a, why) {
   return `${PROVIDER_NAME} refused this sign-in (401)${why ? `; ${why}` : ""}. ${hint}`
 }
 
+// The config hook's models are read in OpenCode's config shape, so the
+// list Magpie hands back may have lost the capabilities this plugin builds
+// (reasoning, image). Keep the fresh entries and take only what a user
+// changed in the config.
+function withConfiguredModels(defaults, configured) {
+  if (!configured || typeof configured !== "object") return defaults
+  for (const [id, m] of Object.entries(configured)) {
+    if (!m || typeof m !== "object") continue
+    const base = defaults[id]
+    if (!base) {
+      defaults[id] = m
+      continue
+    }
+    defaults[id] = {
+      ...base,
+      ...(typeof m.name === "string" && m.name ? { name: m.name } : {}),
+      limit: { ...base.limit, ...(m.limit ?? {}) },
+      ...(m.options && typeof m.options === "object" ? { options: { ...base.options, ...m.options } } : {}),
+    }
+  }
+  return defaults
+}
+
 /**
  * Factory for the Amazon Quick OpenCode / Magpie plugin, supporting dependency injection for unit tests.
  * @param {object} [deps]
@@ -105,7 +128,7 @@ export function createAmazonQuickPlugin(deps = {}) {
         id: PROVIDER_ID,
         async models(provider, { auth } = {}) {
           const fallbackUrl = provider?.api || DEFAULT_API_URL
-          const base = provider?.models && Object.keys(provider.models).length ? provider.models : configModels(PROVIDER_ID, fallbackUrl)
+          const base = withConfiguredModels(configModels(PROVIDER_ID, fallbackUrl), provider?.models)
           if (auth?.type !== "oauth" || !(auth.access || auth.source)) return base
           try {
             const a = await getCurrentAuth(client, auth, authDeps)
