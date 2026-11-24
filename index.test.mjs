@@ -3003,3 +3003,69 @@ test("a failed system-attachment upload drops the pointer instead of naming a mi
   assert.ok(!/system_instructions\.txt/.test(frame.text), "no pointer may survive a failed upload")
   assert.ok(frame.text.includes("SYS-HEAD"), "the anchor still gives the model its persona")
 })
+
+test("Stage 5 keeps the Stage 4 line references and droppedRange when it adds the system pointer", async () => {
+  const pad = (n) => "（性格补充）。".repeat(n)
+  const SYS = "SYS-HEAD " + pad(3500) + " SYS-TAIL"
+  const msgs = [{ role: "system", content: SYS }]
+  for (let i = 0; i < 60; i++) {
+    msgs.push({ role: "user", content: "历史提问 " + i + " " + "内容".repeat(60) })
+    msgs.push({ role: "assistant", content: "历史回答 " + i + " " + "回复".repeat(60) })
+  }
+  msgs.push({ role: "user", content: "尾部 " + "尾部内容".repeat(5000) })
+  const plan = openaiToSncsRequest({ model: "balanced", messages: msgs }, {})
+
+  // Both attachments exist, so both sets of line references must survive.
+  assert.ok(plan.overflowUserText.includes("DROPPED EARLIER HISTORY"))
+  assert.ok(plan.sysAttachmentText.includes("SYS-HEAD"))
+  assert.ok(plan.textWithAttachmentNote, "the attachment variant of the frame must exist")
+
+  // prompt_context line refs: the dropped-history range and the per-message range
+  assert.match(plan.textWithAttachmentNote, /Omitted earlier history is in lines \d+-\d+/)
+  assert.match(plan.textWithAttachmentNote, /attached file prompt_context_[a-z0-9]+\.txt lines \d+-\d+/i)
+  // system_instructions line ref, in BOTH frame variants
+  assert.match(plan.textWithAttachmentNote, /system_instructions\.txt lines \d+-\d+/)
+  assert.match(plan.userMessagePayload.text, /system_instructions\.txt lines \d+-\d+/)
+
+  const wire = buildAidpInputFrame({ type: "user_message", payload: plan.userMessagePayload }).byteLength
+  const wireNote = buildAidpInputFrame({
+    type: "user_message",
+    payload: { ...plan.userMessagePayload, text: plan.textWithAttachmentNote },
+  }).byteLength
+  assert.ok(wire <= MAX_USER_MESSAGE_FRAME_BYTES, `plain frame within budget, got ${wire}`)
+  assert.ok(wireNote <= MAX_USER_MESSAGE_FRAME_BYTES, `note frame within budget, got ${wireNote}`)
+})
+
+test("an uploaded system_instructions.txt always has an inline pointer, even near the frame limit", async () => {
+  const pad = (n) => "（性格补充）。".repeat(n)
+  let withAttachment = 0
+  // Sweep the band where Stage 3 lands just under the limit and Stage 4 does not
+  // engage: the pointer used to be dropped silently there, orphaning the upload.
+  for (let repeat = 3000; repeat <= 4200; repeat += 40) {
+    for (const tailLen of [500, 2000, 4000, 8000]) {
+      const SYS = "SYS-HEAD " + pad(repeat) + " SYS-TAIL"
+      let tail = "尾"
+      while (tail.length < tailLen) tail += "尾部内容"
+      const plan = openaiToSncsRequest({ model: "balanced", messages: [{ role: "system", content: SYS }, { role: "user", content: tail }] }, {})
+      const text = plan.userMessagePayload.text || ""
+      const wire = buildAidpInputFrame({ type: "user_message", payload: plan.userMessagePayload }).byteLength
+      assert.ok(wire <= MAX_USER_MESSAGE_FRAME_BYTES, `frame within budget at repeat=${repeat} tail=${tailLen}, got ${wire}`)
+      if (!plan.sysAttachmentText) continue
+      withAttachment++
+      assert.match(
+        text,
+        /system_instructions\.txt lines \d+-\d+/,
+        `the upload must be announced in the frame (repeat=${repeat} tail=${tailLen})`,
+      )
+      assert.ok(text.includes("SYS-HEAD"), "the anchor must survive too")
+      if (plan.textWithAttachmentNote) {
+        const wireNote = buildAidpInputFrame({
+          type: "user_message",
+          payload: { ...plan.userMessagePayload, text: plan.textWithAttachmentNote },
+        }).byteLength
+        assert.ok(wireNote <= MAX_USER_MESSAGE_FRAME_BYTES, `note frame within budget, got ${wireNote}`)
+      }
+    }
+  }
+  assert.ok(withAttachment > 0, "the sweep must actually produce attachments")
+})

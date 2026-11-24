@@ -330,6 +330,8 @@ export const MAX_USER_MESSAGE_FRAME_BYTES = 62_000
 const OVERFLOW_ATTACHMENT_RESERVE_BYTES = 800
 // How much of a trimmed system prompt still rides inline as an anchor.
 const SYSTEM_ANCHOR_CHARS = 2048
+// Smallest inline system text worth keeping once the attachment pointer must fit.
+const SYSPOINTER_MIN_ANCHOR_CHARS = 256
 const SYSTEM_ATTACHMENT_NAME = "system_instructions.txt"
 
 const WEB_SEARCH_ENV = "MAGPIE_QUICK_WEB_SEARCH"
@@ -1409,6 +1411,8 @@ export function openaiToSncsRequest(body, opts = {}) {
   // with-attachment inline texts structurally (zero string search).
   let overflowUserText = ""
   let textWithAttachmentNote = ""
+  // Set by Stage 4 when it produced the attachment variant of the frame.
+  let attachState = null
   const mayAttachOverflow = !opts.disableAttachments && opts.uploadLargeText !== false
   const historyToSpill = !isResume ? droppedBlocks : []
 
@@ -1455,6 +1459,10 @@ export function openaiToSncsRequest(body, opts = {}) {
       blocks = plainBlocks
       text = composeText(sysText, toolsText, plainBlocks)
       textWithAttachmentNote = composeText(sysText, toolsText, attachBlocks, attachNote)
+      // Stage 5 must be able to rebuild the note variant after the system pointer
+      // is known. Keep the exact attach-blocks (they carry per-message line refs
+      // into the overflow file) and the note itself (it carries droppedRange).
+      attachState = { attachBlocks, attachNote, protectedStart }
     }
 
     const totalOrigChars = origProtectedLens.reduce((a, b) => a + b, 0)
@@ -1511,14 +1519,33 @@ export function openaiToSncsRequest(body, opts = {}) {
     sysAttachmentText = origSysText
     sysAttachmentRange = { name: SYSTEM_ATTACHMENT_NAME, startLine: 1, endLine: origSysText.split("\n").length }
     sysPointer = sysAttachmentRange
-    const withPointer = composeText(sysText, toolsText, blocks)
-    if (measure(withPointer) <= maxFrameBytes) {
-      text = withPointer
+    // Rebuild BOTH variants from the same preserved state, so the pointer lands in
+    // the plain frame and in the attachment variant without discarding the
+    // per-message line refs and the droppedRange note Stage 4 produced.
+    const rebuild = () => {
+      text = composeText(sysText, toolsText, blocks)
       curBytes = measure(text)
+      if (attachState) {
+        textWithAttachmentNote = composeText(sysText, toolsText, attachState.attachBlocks, attachState.attachNote)
+      } else if (textWithAttachmentNote) {
+        textWithAttachmentNote = composeText(sysText, toolsText, blocks, buildOverflowAttachmentNote(overflowAttachmentName, null))
+      }
     }
-    if (textWithAttachmentNote) {
-      const withPointerNote = composeText(sysText, toolsText, blocks, buildOverflowAttachmentNote(overflowAttachmentName, null))
-      if (measure(withPointerNote) <= maxFrameBytes) textWithAttachmentNote = withPointerNote
+    rebuild()
+    // The pointer must always reach the frame: an uploaded system_instructions.txt
+    // the model is never told about is a wasted upload and a silent persona loss.
+    // Shrink the inline system text (down to the anchor) until the pointer fits.
+    let guard = 0
+    while (
+      guard++ < 32 &&
+      (curBytes > maxFrameBytes || (textWithAttachmentNote && measure(textWithAttachmentNote) > maxFrameBytes))
+    ) {
+      if (sysText.length <= SYSPOINTER_MIN_ANCHOR_CHARS) break
+      const keep = Math.max(SYSPOINTER_MIN_ANCHOR_CHARS, Math.floor((sysText.length * maxFrameBytes * 0.97) / Math.max(1, curBytes)))
+      const next = keep < sysText.length ? truncateMiddle(origSysText, keep) : ""
+      if (!next || next === sysText) break
+      sysText = next
+      rebuild()
     }
   }
   // Delivered means: no system text at all, or it rode inline whole on a fresh
