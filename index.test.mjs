@@ -648,6 +648,9 @@ test("AmazonQuickAuthPlugin executes SSE streaming, 401 token retry, usage, and 
   assert.equal(cfg.provider["amazon-quick-plus"].npm, "@ai-sdk/openai-compatible")
   assert.equal(cfg.provider["amazon-quick-plus"].api, "https://quick.aws.com/v1")
   assert.equal(cfg.provider["amazon-quick-plus"].models.balanced.api.url, "https://quick.aws.com/v1")
+  assert.equal(cfg.provider["amazon-quick-plus"].models.balanced.reasoning, true)
+  assert.equal(cfg.provider["amazon-quick-plus"].models.fast.reasoning, false)
+  assert.deepEqual(cfg.provider["amazon-quick-plus"].models.balanced.modalities.input, ["text", "image"])
 
   // loader SSE stream with 401 refresh recovery (plus Uint8Array body & non-empty baseURL)
   const loader = await plugin.auth.loader(async () => stored)

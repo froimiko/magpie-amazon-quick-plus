@@ -117,6 +117,17 @@ export function buildProviderModelEntry(providerID, spec, baseURL = DEFAULT_API_
     providerID,
     name: spec.name,
     api: { id: spec.id, url: apiUrl, npm: "@ai-sdk/openai-compatible" },
+    // A config model is read in OpenCode's config shape (top-level
+    // reasoning/attachment/tool_call/modalities, provider for its route);
+    // the provider.models hook is read through capabilities below. Both
+    // are given so magpie keeps the model's reasoning and image support
+    // when it merges the config hook's list.
+    provider: { npm: "@ai-sdk/openai-compatible", api: apiUrl },
+    temperature: true,
+    reasoning: !!spec.reasoning,
+    attachment: true,
+    tool_call: true,
+    modalities: { input: ["text", "image"], output: ["text"] },
     status: "active",
     headers: {},
     options: {},
