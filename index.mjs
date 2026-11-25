@@ -107,11 +107,13 @@ export function createAmazonQuickPlugin(deps = {}) {
   const runFetchQuickSettings = deps.fetchQuickSettings ?? fetchQuickSettings
   const runExecuteSncsChat = deps.executeSncsChat ?? executeSncsChat
   const authDeps = { ...deps, providerId: PROVIDER_ID }
-  // A relayed system message only reaches Quick's agent instruction layer
-  // through a draft agent, so the plugin asks for carrier mode by default;
-  // MAGPIE_QUICK_AGENT_MODE=off (or a deps.agentMode override) turns it off and
-  // the bridge falls back to the inline <instructions> path.
-  const turnDeps = { ...deps, agentMode: agentMode({ ...deps, defaultMode: "carrier" }) }
+  // A relayed system message can reach Quick's agent instruction layer
+  // through a draft agent, but the channel is opt-in: every turn then answers
+  // under the carrier agent's instruction layer, which long sessions on 0.4.2
+  // reported as losing the caller's context. MAGPIE_QUICK_AGENT_MODE=carrier
+  // (or a deps.agentMode override) turns it on; off keeps the inline
+  // <instructions> path.
+  const turnDeps = { ...deps, agentMode: agentMode({ ...deps, defaultMode: "off" }) }
 
   return async function AmazonQuickAuthPlugin(ctx = {}) {
     const client = ctx?.client
