@@ -13,6 +13,7 @@ import {
   surfaceTypeForPlatform,
   uploadQuickAttachment,
 } from "./credentials.mjs"
+import { agentModeEnabled, DEFAULT_AGENT_STORE, ensureCarrierAgent } from "./agents.mjs"
 
 export const DEFAULT_API_URL = "https://quick.aws.com/v1"
 export const DEFAULT_CONTEXT_LIMIT = 1_000_000
@@ -327,12 +328,33 @@ async function resolveImageBytes(urlStr, fetchImpl, signal) {
 
 export const MAX_USER_MESSAGE_FRAME_BYTES = 62_000
 const OVERFLOW_ATTACHMENT_RESERVE_BYTES = 800
+// How much of a trimmed system prompt still rides inline as an anchor.
+const SYSTEM_ANCHOR_CHARS = 2048
+// Smallest inline system text worth keeping once the attachment pointer must fit.
+const SYSPOINTER_MIN_ANCHOR_CHARS = 256
+const SYSTEM_ATTACHMENT_NAME = "system_instructions.txt"
+
+const WEB_SEARCH_ENV = "MAGPIE_QUICK_WEB_SEARCH"
+
+/**
+ * Default for `web_search_enabled` when the request body does not state one.
+ *
+ * Quick's own cloud search answers before the caller's tool chain can, so an
+ * operator may want it off for every turn instead of per request. The body (and
+ * `opts.webSearchEnabled`) always wins; this only supplies the fallback via the
+ * `MAGPIE_QUICK_WEB_SEARCH` env switch, defaulting to on like the desktop app.
+ */
+export function webSearchDefaultEnabled() {
+  const raw = String(process.env?.[WEB_SEARCH_ENV] ?? "").trim().toLowerCase()
+  if (!raw) return true
+  return !["0", "off", "no", "false", "disabled", "disable", "none"].includes(raw)
+}
 
 function buildOverflowAttachmentNote(attachmentName, droppedRange = null) {
   const droppedPart = droppedRange
     ? ` Omitted earlier history is in lines ${droppedRange.startLine}-${droppedRange.endLine}.`
     : ""
-  return `[Note: Full untruncated content is attached in your Quick workspace at /workspace/attached_files/${attachmentName}.${droppedPart} Exception to the no-container-tools rule: use your built-in workspace file reader to read this attachment directly instead of re-reading those lines via local <tool_call>.]`
+  return `[Note: Full untruncated content is attached in your Quick workspace at /workspace/attached_files/${attachmentName} (workspace-relative path: attached_files/${attachmentName}).${droppedPart} Exception to the no-container-tools rule: use your built-in workspace file reader to read this attachment directly instead of re-reading those lines via local <tool_call>.]`
 }
 
 function snapHeadToLineBoundary(s, targetHead) {
@@ -401,9 +423,24 @@ function describeBlockForHeader(block, index) {
   return `SECTION #${index + 1}`
 }
 
-function buildOverflowDocument(droppedBlocks, protectedBlocks, attachmentName) {
+/**
+ * Rebuild the overflow attachment: system instructions first (they are the one
+ * thing the frame can never carry whole), then dropped history, then the
+ * protected current turn. Line numbers are exact so the inline note can point
+ * at a range instead of asking the model to search.
+ */
+function buildOverflowDocument(droppedBlocks, protectedBlocks, attachmentName, systemBlock = null) {
   const lines = []
   let droppedRange = null
+  let sysRange = null
+  const sysText = String(systemBlock?.text || "")
+  if (sysText) {
+    if (lines.length) lines.push("")
+    lines.push("=== SYSTEM INSTRUCTIONS (complete, verbatim) ===")
+    const startLine = lines.length + 1
+    lines.push(...sysText.split("\n"))
+    sysRange = { name: attachmentName, startLine, endLine: lines.length }
+  }
   if (droppedBlocks.length) {
     lines.push(`=== DROPPED EARLIER HISTORY (${droppedBlocks.length} message(s)) ===`)
     const startLine = lines.length + 1
@@ -435,6 +472,7 @@ function buildOverflowDocument(droppedBlocks, protectedBlocks, attachmentName) {
     text: lines.join("\n"),
     droppedRange,
     protectedRanges,
+    sysRange,
   }
 }
 
@@ -958,6 +996,9 @@ export function createThreadStore(maxEntries = THREAD_CACHE_MAX, ttlMs = THREAD_
             toolsChanged,
             prevToolMap: entry.toolMap || null,
             lang: entry.lang || "",
+            // "" means this thread never received the caller's system text, so
+            // the resumed turn must re-send it instead of diffing against nothing.
+            deliveredSysText: entry.sysText || "",
             allHashes: hashes,
             toolsSig,
           }
@@ -1012,6 +1053,7 @@ export function createThreadStore(maxEntries = THREAD_CACHE_MAX, ttlMs = THREAD_
           toolsChanged,
           prevToolMap: entry.toolMap || null,
           lang: entry.lang || "",
+          deliveredSysText: entry.sysText || "",
           allHashes: hashes,
           toolsSig,
         }
@@ -1107,6 +1149,9 @@ export function openaiToSncsRequest(body, opts = {}) {
   const rawSystemText = rawSystemParts.join("\n\n")
   const convoHashes = convoMessages.map(messageDigest)
 
+  // Declared here so composeText (which runs before the pipeline stages below)
+  // can see whether this turn must re-send a system prompt the thread never got.
+  let origSysText = ""
   const resumeState = opts.resumeState || null
   const isResume = Boolean(resumeState?.threadId && Array.isArray(resumeState?.deltaMessages) && resumeState.deltaMessages.length)
   const toolsChangedOnResume = isResume && Boolean(resumeState?.toolsChanged)
@@ -1139,16 +1184,36 @@ export function openaiToSncsRequest(body, opts = {}) {
       ? body.web_search_enabled
       : typeof opts.webSearchEnabled === "boolean"
         ? opts.webSearchEnabled
-        : true
+        : webSearchDefaultEnabled()
   const surfaceType = surfaceTypeForPlatform(opts.platform)
   const maxFrameBytes = Number(opts.maxFrameBytes) > 0 ? Number(opts.maxFrameBytes) : MAX_USER_MESSAGE_FRAME_BYTES
 
+  // Set once the turn decides the caller's system text could not ride in full:
+  // the inline block then keeps only a head anchor plus a pointer at the exact
+  // attachment line range, so the persona is never silently absent.
+  let sysPointer = null
+  const sysPointerBlock = () => {
+    if (!sysPointer) return ""
+    const at = sysPointer.name
+      ? `attached_files/${sysPointer.name} lines ${sysPointer.startLine}-${sysPointer.endLine}`
+      : "the attached file"
+    return `[System instructions are long: the exact opening is above and the complete text is in ${at}. Read that file with your workspace file reader before relying on tone, persona, or formatting rules.]`
+  }
+
+  // A resumed thread that never received the caller's system text inline gets one
+  // corrective full send. The diff baseline is deliberately empty in that case,
+  // so a <system_context_update> would only carry a meaningless +/- diff of a
+  // text the thread never saw; the whole block has to go out instead.
+  const hasCallerSystem = rawSystemParts.some((part) => String(part || "").trim())
+  const resendSystem = isResume && hasCallerSystem && !String(resumeState?.deliveredSysText || "").trim()
+
   const composeText = (sysText, toolsText, blockList, note = "") => {
-    const instrParts = isResume ? [] : [sysText, toolsText].filter(Boolean)
+    const pointer = isResume && !resendSystem ? "" : sysPointerBlock()
+    const instrParts = isResume && !resendSystem ? [] : [sysText, pointer, toolsText].filter(Boolean)
     const bodyText = blockList.map((b) => (typeof b === "string" ? b : b?.text || "")).filter(Boolean).join("\n\n")
     const parts = []
     if (instrParts.length) parts.push(`<instructions>\n${instrParts.join("\n\n")}\n</instructions>`)
-    if (isResume && resumeState.systemUpdate) {
+    if (isResume && resumeState.systemUpdate && !resendSystem) {
       parts.push(`<system_context_update>\n${resumeState.systemUpdate}\n</system_context_update>`)
     }
     if (isResume && toolsText) {
@@ -1173,6 +1238,10 @@ export function openaiToSncsRequest(body, opts = {}) {
     ? buildBridgeCustomPrompt(tools, opts.customPrompt || "", lang)
     : opts.customPrompt || null
 
+  // Carrier draft agent: when the channel is available the account's neutral
+  // draft agent answers, so the caller's system text still reaches the agent
+  // instruction layer. "" / null keeps the plain inline path.
+  const carrierAgentId = String(opts.chatAgentId ?? "").trim()
   const buildUserPayload = (textVal) => ({
     traceId: randomUUID(),
     text: textVal,
@@ -1186,7 +1255,10 @@ export function openaiToSncsRequest(body, opts = {}) {
     user_timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
     user_locale: opts.locale || Intl.DateTimeFormat().resolvedOptions().locale || "en-US",
     custom_prompt: customPrompt,
-    chat_agent_id: null,
+    chat_agent_id: carrierAgentId || null,
+    // Only sent alongside a real agent id, so a carrier-off turn keeps the exact
+    // frame shape it had before this channel existed.
+    ...(carrierAgentId ? { use_draft: true } : {}),
     auto_routing: autoRouting,
     web_search_enabled: webSearchEnabled,
     incognito: true,
@@ -1194,7 +1266,9 @@ export function openaiToSncsRequest(body, opts = {}) {
 
   const measure = (textVal) => buildAidpInputFrame({ type: "user_message", payload: buildUserPayload(textVal) }).byteLength
 
-  const origSysText = isResume ? "" : normalizeClientSystemText(rawSystemParts.join("\n\n"))
+  // On resume the text is normally withheld (it was already delivered), but the
+  // pipeline still needs it when the thread never received it.
+  origSysText = normalizeClientSystemText(rawSystemParts.join("\n\n"))
   let sysText = origSysText
   let blocks = convoBlocks.map((b) => ({ ...b }))
   let toolsText = fullToolsPrompt
@@ -1288,16 +1362,45 @@ export function openaiToSncsRequest(body, opts = {}) {
     }
   }
 
-  // Stage 3: Trim long system prompt text, leaving tools protocol and protected turn intact
-  if (!isResume && curBytes > maxFrameBytes && sysText) {
+  // Stage 3: Trim long system prompt text, leaving tools protocol and protected turn intact.
+  //
+  // The budget is computed from `withoutSysBytes`, which at this point still
+  // holds the *uncompacted* current turn. A long CJK turn can push that past the
+  // frame limit on its own, which used to drive `sysBudget` to 0 and blank the
+  // caller's system text completely. The block below never blanks it: it keeps a
+  // head anchor, and any trimmed system text is preserved as an attachment by
+  // the systemOverflow step that follows Stage 4.
+  let sysTrimmed = false
+  if ((!isResume || resendSystem) && curBytes > maxFrameBytes && sysText) {
     const withoutSysBytes = measure(composeText("", toolsText, blocks))
-    let sysBudget = Math.max(0, Math.floor((maxFrameBytes - withoutSysBytes) * 0.65))
-    sysText = sysBudget > 256 ? truncateMiddle(origSysText, sysBudget) : ""
+    let sysBudget = Math.floor((maxFrameBytes - withoutSysBytes) * 0.65)
+    if (sysBudget > 256) {
+      sysText = truncateMiddle(origSysText, sysBudget)
+    } else {
+      sysText = truncateMiddle(origSysText, Math.min(origSysText.length, SYSTEM_ANCHOR_CHARS))
+    }
+    sysTrimmed = sysText !== origSysText
     text = composeText(sysText, toolsText, blocks)
     curBytes = measure(text)
-    for (let over = curBytes - maxFrameBytes; over > 0 && sysText.length > 0; over = curBytes - maxFrameBytes) {
-      sysBudget = sysBudget - Math.max(200, Math.ceil(over * 0.75))
-      sysText = sysBudget > 256 ? truncateMiddle(origSysText, sysBudget) : ""
+    // `sysBudget` counts characters while the frame is measured in bytes, and a
+    // CJK character costs ~3 bytes before base64 inflates it again — so the loop
+    // shrinks proportionally against the real byte figure instead of subtracting
+    // character counts, which never converged for CJK prompts.
+    let guard = 0
+    while (curBytes > maxFrameBytes && sysText.length > 0 && guard++ < 32) {
+      const keep = Math.floor((sysText.length * maxFrameBytes * 0.97) / curBytes)
+      const next = keep > 256 ? truncateMiddle(origSysText, keep) : ""
+      if (next === sysText) break
+      sysText = next
+      sysTrimmed = true
+      text = composeText(sysText, toolsText, blocks)
+      curBytes = measure(text)
+    }
+    // Out of trim budget: fall back to the anchor rather than an empty block, so
+    // the model still sees who it is meant to be.
+    if (!sysText && origSysText) {
+      sysText = truncateMiddle(origSysText, Math.min(origSysText.length, SYSTEM_ANCHOR_CHARS))
+      sysTrimmed = sysText !== origSysText
       text = composeText(sysText, toolsText, blocks)
       curBytes = measure(text)
     }
@@ -1308,6 +1411,8 @@ export function openaiToSncsRequest(body, opts = {}) {
   // with-attachment inline texts structurally (zero string search).
   let overflowUserText = ""
   let textWithAttachmentNote = ""
+  // Set by Stage 4 when it produced the attachment variant of the frame.
+  let attachState = null
   const mayAttachOverflow = !opts.disableAttachments && opts.uploadLargeText !== false
   const historyToSpill = !isResume ? droppedBlocks : []
 
@@ -1354,6 +1459,10 @@ export function openaiToSncsRequest(body, opts = {}) {
       blocks = plainBlocks
       text = composeText(sysText, toolsText, plainBlocks)
       textWithAttachmentNote = composeText(sysText, toolsText, attachBlocks, attachNote)
+      // Stage 5 must be able to rebuild the note variant after the system pointer
+      // is known. Keep the exact attach-blocks (they carry per-message line refs
+      // into the overflow file) and the note itself (it carries droppedRange).
+      attachState = { attachBlocks, attachNote, protectedStart }
     }
 
     const totalOrigChars = origProtectedLens.reduce((a, b) => a + b, 0)
@@ -1398,6 +1507,56 @@ export function openaiToSncsRequest(body, opts = {}) {
     }
   }
 
+  // Stage 5: system preservation. Stage 3 can only trim the caller's system text
+  // (a long CJK turn consumes the whole frame on its own), and the trim is lossy:
+  // truncateMiddle drops the middle. Whenever it was trimmed, the full original
+  // text becomes its own attachment. This runs even when the protected turn was
+  // short enough that Stage 4 never engaged — the large-system-plus-one-line-user
+  // case, where the trimmed middle would otherwise vanish with no attachment.
+  let sysAttachmentText = ""
+  let sysAttachmentRange = null
+  if ((!isResume || resendSystem) && origSysText && sysTrimmed && mayAttachOverflow) {
+    sysAttachmentText = origSysText
+    sysAttachmentRange = { name: SYSTEM_ATTACHMENT_NAME, startLine: 1, endLine: origSysText.split("\n").length }
+    sysPointer = sysAttachmentRange
+    // Rebuild BOTH variants from the same preserved state, so the pointer lands in
+    // the plain frame and in the attachment variant without discarding the
+    // per-message line refs and the droppedRange note Stage 4 produced.
+    const rebuild = () => {
+      text = composeText(sysText, toolsText, blocks)
+      curBytes = measure(text)
+      if (attachState) {
+        textWithAttachmentNote = composeText(sysText, toolsText, attachState.attachBlocks, attachState.attachNote)
+      } else if (textWithAttachmentNote) {
+        textWithAttachmentNote = composeText(sysText, toolsText, blocks, buildOverflowAttachmentNote(overflowAttachmentName, null))
+      }
+    }
+    rebuild()
+    // The pointer must always reach the frame: an uploaded system_instructions.txt
+    // the model is never told about is a wasted upload and a silent persona loss.
+    // Shrink the inline system text (down to the anchor) until the pointer fits.
+    let guard = 0
+    while (
+      guard++ < 32 &&
+      (curBytes > maxFrameBytes || (textWithAttachmentNote && measure(textWithAttachmentNote) > maxFrameBytes))
+    ) {
+      if (sysText.length <= SYSPOINTER_MIN_ANCHOR_CHARS) break
+      const keep = Math.max(SYSPOINTER_MIN_ANCHOR_CHARS, Math.floor((sysText.length * maxFrameBytes * 0.97) / Math.max(1, curBytes)))
+      const next = keep < sysText.length ? truncateMiddle(origSysText, keep) : ""
+      if (!next || next === sysText) break
+      sysText = next
+      rebuild()
+    }
+  }
+  // Delivered means: no system text at all, or it rode inline whole on a fresh
+  // thread, or the complete text is in an attachment the turn uploads.
+  // `systemDeliveredInline` is the baseline a later resume may diff against: a
+  // diff only makes sense when the server thread itself holds the full text.
+  // An attachment delivery satisfies the model for this turn but leaves the
+  // thread without a baseline, so the next resume re-sends it.
+  const systemDeliveredInline = !origSysText || (!sysTrimmed && (!isResume || resendSystem))
+  const systemDelivered = systemDeliveredInline || Boolean(sysAttachmentText)
+
   return {
     modelId,
     hasTools,
@@ -1406,9 +1565,17 @@ export function openaiToSncsRequest(body, opts = {}) {
     toolsSig,
     toolMap,
     rawSystemText,
+    // Whether THIS turn actually put the caller's system text in front of the
+    // model (inline whole, or complete in an attachment it uploads). The thread
+    // store keeps this per thread so a later resume can re-send what was missed.
+    systemDelivered,
+    systemDeliveredInline,
+    sysTextInFrame: sysText,
     convoHashes,
     imageUrls: collectImageUrls(outboundMsgs),
     overflowUserText,
+    sysAttachmentText,
+    sysAttachmentRange,
     overflowAttachmentName,
     textWithAttachmentNote,
     stream: body?.stream === true,
@@ -1840,6 +2007,16 @@ export async function executeSncsChat(a, openaiBody, opts = {}) {
   const stateful = opts.stateful !== false && !opts.disableResume && !opts.threadId && !!threadStore
   const accountKey = accountKeyOf(a)
 
+  // Resolve (once per account) the neutral draft agent that carries the turn's
+  // instructions into Quick's agent layer. Any failure yields "" and the turn
+  // continues on the plain inline <instructions> path.
+  const agentStore = opts.agentStore === undefined ? DEFAULT_AGENT_STORE : opts.agentStore
+  let chatAgentId = String(opts.chatAgentId ?? "").trim()
+  if (!chatAgentId && agentModeEnabled(opts)) {
+    chatAgentId = await ensureCarrierAgent(a, { ...opts, accountKey })
+  }
+  const turnOpts = chatAgentId ? { ...opts, chatAgentId } : opts
+
   let resumeState = null
   let releaseInflight = null
 
@@ -1869,7 +2046,7 @@ export async function executeSncsChat(a, openaiBody, opts = {}) {
     // nor overwrite the main thread's cache entries.
     if (!hasTools && threadStore.hasToolThread?.(accountKey, sessionId, convo)) {
       return await runSncsTurn(a, openaiBody, {
-        ...opts,
+        ...turnOpts,
         stateful: false,
         resumeState: null,
         threadStore: null,
@@ -1893,7 +2070,7 @@ export async function executeSncsChat(a, openaiBody, opts = {}) {
 
   try {
     return await runSncsTurn(a, openaiBody, {
-      ...opts,
+      ...turnOpts,
       resumeState,
       accountKey,
       threadStore,
@@ -1906,11 +2083,48 @@ export async function executeSncsChat(a, openaiBody, opts = {}) {
       threadStore.invalidate(accountKey, opts.sessionId || "", resumeState.threadId)
     }
     releaseInflight?.()
+
+    // A cached draft agent the service no longer has (deleted, quota-cleaned, or
+    // created under a previous sign-in) fails the turn before any model output.
+    // Drop the dead id from memory and disk, then retry once with no agent at all
+    // so the caller still gets an answer on the inline <instructions> path.
+    const authLike = err?.status === 401 || err?.status === 403
+    if (chatAgentId && !authLike && !opts.signal?.aborted) {
+      try {
+        agentStore?.forget?.(accountKey)
+      } catch {}
+      // One retry only: the inline path needs no agent, and a second failure is a
+      // real upstream problem the caller should see.
+      return await runSncsTurn(a, openaiBody, {
+        ...opts,
+        chatAgentId: null,
+        resumeState: null,
+        accountKey,
+        threadStore,
+        WS,
+      })
+    }
+
     if (canRetryFresh) {
-      return await runSncsTurn(a, openaiBody, { ...opts, resumeState: null, accountKey, threadStore, WS })
+      return await runSncsTurn(a, openaiBody, { ...turnOpts, resumeState: null, accountKey, threadStore, WS })
     }
     throw err
   }
+}
+
+/**
+ * Remove the "the rest is in attached_files/..." pointer from a composed frame.
+ * Used when that upload failed: pointing the model at a file that is not there
+ * is worse than saying nothing, because it will try to read it and stall.
+ */
+function stripSystemPointer(text) {
+  const s = String(text || "")
+  const marker = "[System instructions are long:"
+  if (!s.includes(marker)) return s
+  return s
+    .split("\n\n")
+    .filter((part) => !part.trimStart().startsWith(marker))
+    .join("\n\n")
 }
 
 function serializeWireAttachment(att) {
@@ -1929,7 +2143,8 @@ async function prepareTurnAttachments(a, reqPlan, opts) {
   if (opts.disableAttachments) return []
   const hasImages = Array.isArray(reqPlan.imageUrls) && reqPlan.imageUrls.length > 0
   const hasOverflow = Boolean(reqPlan.overflowUserText) && opts.uploadLargeText !== false
-  if (!hasImages && !hasOverflow) return []
+  const hasSysAttachment = Boolean(reqPlan.sysAttachmentText) && opts.uploadLargeText !== false
+  if (!hasImages && !hasOverflow && !hasSysAttachment) return []
 
   const uploader = opts.uploadAttachment ?? uploadQuickAttachment
   const fetchImpl = opts.fetch ?? fetch
@@ -1968,6 +2183,23 @@ async function prepareTurnAttachments(a, reqPlan, opts) {
     )
   }
 
+  // The caller's system text, when Stage 3 could only trim it. Uploaded under its
+  // own name so the inline pointer can name a line range in it.
+  if (hasSysAttachment) {
+    const sysName = reqPlan.sysAttachmentRange?.name || "system_instructions.txt"
+    tasks.push(
+      (async () => {
+        const bytes = Buffer.from(reqPlan.sysAttachmentText, "utf8")
+        const uploaded = await uploader(
+          a,
+          { name: sysName, mimeType: "text/plain", bytes, threadId: reqPlan.threadId },
+          opts,
+        )
+        return serializeWireAttachment(uploaded)
+      })(),
+    )
+  }
+
   const settled = await Promise.allSettled(tasks)
   const attachments = []
   for (const r of settled) {
@@ -1995,6 +2227,19 @@ async function runSncsTurn(a, openaiBody, ctx) {
     if (reqPlan.textWithAttachmentNote && attachments.some((att) => att?.name === expectedOverflowName)) {
       reqPlan.userMessagePayload.text = reqPlan.textWithAttachmentNote
     }
+  }
+  // A pointer to a file the turn failed to upload would be worse than no pointer:
+  // drop the claim so the model is not told to read something that is not there.
+  const sysName = reqPlan.sysAttachmentRange?.name
+  if (sysName && !attachments.some((att) => att?.name === sysName)) {
+    reqPlan.userMessagePayload.text = stripSystemPointer(reqPlan.userMessagePayload.text)
+    if (reqPlan.textWithAttachmentNote) {
+      reqPlan.textWithAttachmentNote = stripSystemPointer(reqPlan.textWithAttachmentNote)
+    }
+    // The model keeps only the anchor now, so the thread has no full text and
+    // the next resume must send it again.
+    reqPlan.systemDelivered = false
+    reqPlan.systemDeliveredInline = false
   }
 
   const surface = surfaceTypeForPlatform(opts.platform)
@@ -2148,7 +2393,12 @@ async function runSncsTurn(a, openaiBody, ctx) {
         lang: reqPlan.lang || "",
         toolsSig: reqPlan.toolsSig,
         toolMap: reqPlan.toolMap,
-        sysText: reqPlan.rawSystemText,
+        // The diff baseline must be what the model actually saw, not what the
+        // caller wrote: recording rawSystemText after Stage 3 trimmed it made
+        // every later resume compute an empty diff and never re-send the
+        // instructions. When the full text only reached an attachment, the
+        // baseline stays empty so the next turn re-sends it inline.
+        sysText: reqPlan.systemDeliveredInline ? reqPlan.rawSystemText : "",
         msgHashes: reqPlan.convoHashes,
         expectedAssistantSig,
         expectedAssistantCallsSig,

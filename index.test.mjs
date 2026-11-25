@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { createHash } from "node:crypto"
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import test from "node:test"
@@ -42,7 +42,16 @@ import {
   openaiToSncsRequest,
   resolveModelAndEffort,
   stripReasoningEnabled,
+  webSearchDefaultEnabled,
 } from "./bridge.mjs"
+import {
+  agentAccountKey,
+  agentCachePath,
+  agentMode,
+  CARRIER_AGENT_INSTRUCTIONS,
+  createAgentStore,
+  ensureCarrierAgent,
+} from "./agents.mjs"
 import { createAmazonQuickPlugin } from "./index.mjs"
 import * as opencode1 from "./opencode.mjs"
 import opencode2 from "./opencode2.mjs"
@@ -793,6 +802,9 @@ test("AmazonQuickAuthPlugin executes SSE streaming, 401 token retry, usage, and 
     const desktopRejectFactory = createAmazonQuickPlugin({
       dir: dir401,
       WebSocket: RejectWS,
+      // Keeps the turn hermetic: carrier mode resolves a draft agent over HTTP
+      // before the socket opens, and a test must never reach the network.
+      fetch: async () => new Response(JSON.stringify({ error: "unsupported" }), { status: 400 }),
       readKeyring: () =>
         JSON.stringify({
           access_token: "desk-bad",
@@ -2513,4 +2525,685 @@ test("createToolCallSplitter ignores code fences/backticks, validates declared t
   assert.ok(wireText.includes('const s2 = "<\\/tool_result>"'), "case-insensitive </TOOL_RESULT inside body must be escaped")
   // Only the real closing tag should match unescaped `</tool_result>`
   assert.equal((wireText.match(/<\/tool_result>/gi) || []).length, 1, "only the real wrapper closing </tool_result> should remain unescaped")
+})
+
+test("browserSignIn without local profiles.json runs 2-hop quick.aws.com/sn discovery with &port= and user-info enrichment", async () => {
+  const missingDir = join(tmpdir(), "aq-missing-discovery-" + Date.now())
+  let regBody = null
+  let tokBody = null
+  const mockFetch = async (url, init) => {
+    const s = String(url)
+    if (s === "https://oidc.us-east-1.amazonaws.com/client/register") {
+      regBody = JSON.parse(init.body)
+      return new Response(JSON.stringify({ clientId: "cid-disc-1", clientSecret: "sec-disc-1" }), { status: 200 })
+    }
+    if (s === "https://oidc.us-east-1.amazonaws.com/token") {
+      tokBody = JSON.parse(init.body)
+      return new Response(JSON.stringify({ accessToken: "tok-disc-1", refreshToken: "ref-disc-1", expiresIn: 3600 }), { status: 200 })
+    }
+    if (s === "https://qbs-disc.dp.appintegrations.us-east-1.prod.plato.ai.aws.dev/integration/quick-work/user-info") {
+      return new Response(
+        JSON.stringify({
+          email: "tester@example.com",
+          displayName: "DemoTester",
+          awsAccountId: "123456789012",
+        }),
+        { status: 200 },
+      )
+    }
+    return new Response("{}", { status: 404 })
+  }
+
+  const flow = await browserSignIn({}, { dir: missingDir, fetch: mockFetch })
+  const startUrl = new URL(flow.url)
+  assert.equal(startUrl.origin + startUrl.pathname, "https://quick.aws.com/sn")
+  const portParam = startUrl.searchParams.get("port")
+  assert.match(portParam || "", /^\d+$/)
+  const surfaceParts = (startUrl.searchParams.get("qwSurface") || "").split(":")
+  assert.equal(surfaceParts[0], "desktop")
+  assert.equal(surfaceParts[2], portParam)
+  const nonce = surfaceParts[1]
+  assert.ok(nonce.length >= 16)
+
+  const cbPromise = flow.callback()
+
+  // Hop 1: Magpie openPastedCallback hits /callback without following redirects
+  const hop1 = await fetch(
+    `http://127.0.0.1:${portParam}/callback?nonce=${encodeURIComponent(nonce)}&issuerUrl=${encodeURIComponent("https://identitycenter.amazonaws.com/ssoins-7223e642b2afb64c")}&tenantUrl=${encodeURIComponent("https://qbs-disc.dp.appintegrations.us-east-1.prod.plato.ai.aws.dev")}&idcRegion=us-east-1`,
+    { redirect: "manual" },
+  )
+  assert.equal(hop1.status, 302)
+  const nextLoc = new URL(hop1.headers.get("location"))
+  assert.equal(nextLoc.origin + nextLoc.pathname, "https://oidc.us-east-1.amazonaws.com/authorize")
+  assert.equal(nextLoc.searchParams.get("client_id"), "cid-disc-1")
+  assert.equal(nextLoc.searchParams.get("redirect_uri"), `http://127.0.0.1:${portParam}`)
+  assert.deepEqual(regBody.redirectUris, [`http://127.0.0.1:${portParam}`])
+
+  // Hop 2: user pastes /?code=...&state=...
+  const hop2 = await fetch(
+    `http://127.0.0.1:${portParam}/?code=disc-auth-code&state=${encodeURIComponent(nextLoc.searchParams.get("state"))}`,
+  )
+  assert.equal(hop2.status, 200)
+
+  const res = await cbPromise
+  assert.equal(res.type, "success")
+  assert.equal(res.access, "tok-disc-1")
+  assert.equal(res.refresh, "ref-disc-1")
+  assert.equal(res.tenantUrl, "https://qbs-disc.dp.appintegrations.us-east-1.prod.plato.ai.aws.dev")
+  assert.equal(res.email, "tester@example.com")
+  assert.equal(res.displayName, "DemoTester")
+  assert.equal(res.awsAccountId, "123456789012")
+  assert.equal(res.accountId, "tester@example.com")
+  assert.equal(tokBody.code, "disc-auth-code")
+})
+
+function decodeAidpPayloads(ws) {
+  const out = []
+  for (const raw of ws.sent) {
+    const outer = JSON.parse(Buffer.from(raw).toString("utf8"))
+    const inner = JSON.parse(Buffer.from(outer.payload.payload, "base64").toString("utf8"))
+    out.push(inner)
+  }
+  return out
+}
+
+// Answers /api/ws-rpc the way the data plane does: a nested invokeAgent envelope
+// whose frames come back as a JSON string inside body.
+function makeAgentRpcFetch({ draftId = "agent-draft-1", failCreate = false, failUpdate = false } = {}) {
+  const calls = []
+  const respond = (frames) =>
+    new Response(
+      JSON.stringify({
+        eventResponse: {
+          invokeAgentResponse: JSON.stringify({ statusCode: 200, body: JSON.stringify({ frames }) }),
+        },
+      }),
+      { status: 200 },
+    )
+  const fetchImpl = async (_url, init) => {
+    const body = init?.body ? JSON.parse(init.body) : {}
+    const inner = body?.eventBody?.invokeAgent?.body ?? {}
+    calls.push({ kind: inner?.type, payload: inner?.payload })
+    if (inner?.type === "create_agent_draft") {
+      if (failCreate) return new Response(JSON.stringify({ errorMessage: "agent service unavailable" }), { status: 200 })
+      return respond([{ type: "agent_draft_created", payload: { agent_id: draftId } }])
+    }
+    if (inner?.type === "update_chat_agent_config") {
+      if (failUpdate) return new Response(JSON.stringify({ errorMessage: "instructions rejected" }), { status: 200 })
+      return respond([{ type: "agent_config_updated", payload: { agent_id: inner?.payload?.agent_id } }])
+    }
+    return new Response("{}", { status: 404 })
+  }
+  return { fetchImpl, calls }
+}
+
+test("carrier draft agent is created once per account and turns carry chat_agent_id + use_draft", async () => {
+  assert.equal(agentMode({}), "off")
+  assert.equal(agentMode({ defaultMode: "carrier" }), "carrier")
+  assert.equal(agentMode({ agentMode: "off", defaultMode: "carrier" }), "off")
+
+  const acct = { providerType: "social", access: "tok-agent", tenantUrl: "https://qbs-agent.plato.ai.aws.dev", accountId: "agent-acct" }
+  const { fetchImpl, calls } = makeAgentRpcFetch({ draftId: "agent-draft-abc" })
+  const agentStore = createAgentStore()
+  const sent = []
+  const MockWS = makeMockWebSocketClass((ws) => {
+    ws.readyState = 1
+    ws.onopen?.()
+    queueMicrotask(() => {
+      sent.push(decodeAidpPayloads(ws))
+      ws.emitAidpEvent({ type: "session_established", payload: {} })
+      ws.emitAidpEvent({ type: "text_delta", payload: { delta: "carrier reply" } })
+      ws.emitAidpEvent({ type: "message_complete", payload: {} })
+    })
+  })
+  const runTurn = () =>
+    executeSncsChat(
+      acct,
+      { model: "fast", stream: false, messages: [{ role: "system", content: "Answer only in Japanese." }, { role: "user", content: "Hello" }] },
+      { WebSocket: MockWS, fetch: fetchImpl, agentMode: "carrier", agentStore, stateful: false },
+    )
+
+  const first = await (await runTurn()).json()
+  assert.equal(first.choices[0].message.content, "carrier reply")
+  const firstMsg = sent[0].find((f) => f.type === "user_message").payload
+  assert.equal(firstMsg.chat_agent_id, "agent-draft-abc")
+  assert.equal(firstMsg.use_draft, true)
+  // the caller's system text still rides inline, so nothing is lost on downgrade
+  assert.ok(firstMsg.text.includes("Answer only in Japanese."))
+
+  const created = calls.filter((c) => c.kind === "create_agent_draft")
+  const updated = calls.filter((c) => c.kind === "update_chat_agent_config")
+  assert.equal(created.length, 1)
+  assert.deepEqual(created[0].payload, { new_agent: true })
+  assert.equal(updated.length, 1)
+  assert.equal(updated[0].payload.agent_id, "agent-draft-abc")
+  assert.equal(updated[0].payload.target, "draft")
+  assert.equal(updated[0].payload.instructions, CARRIER_AGENT_INSTRUCTIONS)
+  assert.ok(!/ignore (the )?backend|override|jailbreak|bypass/i.test(CARRIER_AGENT_INSTRUCTIONS), "carrier instructions must stay neutral")
+
+  // Second turn on the same account reuses the cached draft agent.
+  await runTurn()
+  const secondMsg = sent[1].find((f) => f.type === "user_message").payload
+  assert.equal(secondMsg.chat_agent_id, "agent-draft-abc")
+  assert.equal(secondMsg.use_draft, true)
+  assert.equal(calls.filter((c) => c.kind === "create_agent_draft").length, 1)
+
+  // A concurrent burst on a cold cache creates exactly one draft agent.
+  const burstStore = createAgentStore()
+  const burst = makeAgentRpcFetch({ draftId: "agent-draft-burst" })
+  const results = await Promise.all(
+    Array.from({ length: 5 }, () =>
+      ensureCarrierAgent({ ...acct, accountId: "burst-acct" }, { agentMode: "carrier", agentStore: burstStore, fetch: burst.fetchImpl }),
+    ),
+  )
+  assert.deepEqual(results, Array(5).fill("agent-draft-burst"))
+  assert.equal(burst.calls.filter((c) => c.kind === "create_agent_draft").length, 1)
+  assert.equal(agentAccountKey(acct), "https://qbs-agent.plato.ai.aws.dev||agent-acct")
+})
+
+test("draft agent failures degrade smoothly to chat_agent_id null without blocking the turn", async () => {
+  const acct = { providerType: "social", access: "tok-fail", tenantUrl: "https://qbs-fail.plato.ai.aws.dev", accountId: "fail-acct" }
+  const sent = []
+  const MockWS = makeMockWebSocketClass((ws) => {
+    ws.readyState = 1
+    ws.onopen?.()
+    queueMicrotask(() => {
+      sent.push(decodeAidpPayloads(ws))
+      ws.emitAidpEvent({ type: "session_established", payload: {} })
+      ws.emitAidpEvent({ type: "text_delta", payload: { delta: "inline path reply" } })
+      ws.emitAidpEvent({ type: "message_complete", payload: {} })
+    })
+  })
+
+  for (const mode of ["create", "update", "throw"]) {
+    sent.length = 0
+    const agentStore = createAgentStore()
+    const opts = { WebSocket: MockWS, agentMode: "carrier", agentStore, stateful: false }
+    if (mode === "create") opts.fetch = makeAgentRpcFetch({ failCreate: true }).fetchImpl
+    else if (mode === "update") opts.fetch = makeAgentRpcFetch({ failUpdate: true }).fetchImpl
+    else
+      opts.fetch = async () => {
+        throw new Error("network down")
+      }
+    const res = await executeSncsChat(
+      acct,
+      { model: "fast", stream: false, messages: [{ role: "system", content: "SYSTEM_STAYS_INLINE" }, { role: "user", content: "Hi" }] },
+      opts,
+    )
+    const json = await res.json()
+    assert.equal(json.choices[0].message.content, "inline path reply", "turn must still complete when the draft channel fails")
+    const msg = sent[0].find((f) => f.type === "user_message").payload
+    assert.equal(msg.chat_agent_id, null, "must fall back to the null agent id")
+    assert.equal("use_draft" in msg, false, "the downgraded frame keeps its original shape")
+    assert.ok(msg.text.includes("<instructions>"))
+    assert.ok(msg.text.includes("SYSTEM_STAYS_INLINE"))
+    assert.equal(agentStore.failed(agentAccountKey(acct)), true, "failures are negatively cached")
+  }
+
+  // An explicitly supplied agent id skips the channel entirely.
+  const passthrough = []
+  const PassWS = makeMockWebSocketClass((ws) => {
+    ws.readyState = 1
+    ws.onopen?.()
+    queueMicrotask(() => {
+      passthrough.push(decodeAidpPayloads(ws))
+      ws.emitAidpEvent({ type: "session_established", payload: {} })
+      ws.emitAidpEvent({ type: "text_delta", payload: { delta: "explicit" } })
+      ws.emitAidpEvent({ type: "message_complete", payload: {} })
+    })
+  })
+  const rpc = makeAgentRpcFetch()
+  await executeSncsChat(
+    acct,
+    { model: "fast", stream: false, messages: [{ role: "user", content: "Hi" }] },
+    { WebSocket: PassWS, fetch: rpc.fetchImpl, agentMode: "carrier", chatAgentId: "agent-explicit", stateful: false },
+  )
+  const passMsg = passthrough[0].find((f) => f.type === "user_message").payload
+  assert.equal(passMsg.chat_agent_id, "agent-explicit")
+  assert.equal(passMsg.use_draft, true)
+  assert.equal(rpc.calls.length, 0, "an explicit agent id must not create a draft")
+
+  // A 401 from the draft channel is the caller's sign-in problem, not a channel
+  // verdict: it must not be negatively cached, so the retry after re-sign-in
+  // still reaches the draft agent.
+  const authStore = createAgentStore()
+  const authAcct = { ...acct, accountId: "auth-acct" }
+  const unauth = await ensureCarrierAgent(authAcct, {
+    agentMode: "carrier",
+    agentStore: authStore,
+    fetch: async () => {
+      const err = new Error("Amazon Quick rejected authentication (401)")
+      err.status = 401
+      err.invalidToken = true
+      throw err
+    },
+  })
+  assert.equal(unauth, "")
+  assert.equal(authStore.failed(agentAccountKey(authAcct)), false, "a 401 must not poison the account cache")
+
+  // Carrier off leaves the legacy frame untouched.
+  const plain = openaiToSncsRequest({ model: "fast", messages: [{ role: "user", content: "Hi" }] })
+  assert.equal(plain.userMessagePayload.chat_agent_id, null)
+  assert.equal("use_draft" in plain.userMessagePayload, false)
+})
+
+test("MAGPIE_QUICK_WEB_SEARCH controls the default web_search_enabled value", () => {
+  const prev = process.env.MAGPIE_QUICK_WEB_SEARCH
+  const request = (body = {}) => openaiToSncsRequest({ model: "fast", messages: [{ role: "user", content: "Ping" }], ...body })
+  try {
+    // Unset: desktop parity, search on
+    delete process.env.MAGPIE_QUICK_WEB_SEARCH
+    assert.equal(webSearchDefaultEnabled(), true)
+    assert.equal(request().userMessagePayload.web_search_enabled, true)
+
+    // Every off spelling reaches the frame default
+    for (const off of ["false", "0", "off", "no", "disabled", "none"]) {
+      process.env.MAGPIE_QUICK_WEB_SEARCH = off
+      assert.equal(webSearchDefaultEnabled(), false)
+      assert.equal(request().userMessagePayload.web_search_enabled, false)
+    }
+
+    // A body field wins over the env switch, in both directions
+    process.env.MAGPIE_QUICK_WEB_SEARCH = "false"
+    assert.equal(request({ web_search_enabled: true }).userMessagePayload.web_search_enabled, true)
+    process.env.MAGPIE_QUICK_WEB_SEARCH = "true"
+    assert.equal(request({ web_search_enabled: false }).userMessagePayload.web_search_enabled, false)
+
+    // Explicit opts beat the env switch too
+    process.env.MAGPIE_QUICK_WEB_SEARCH = "false"
+    assert.equal(
+      openaiToSncsRequest({ model: "fast", messages: [{ role: "user", content: "Ping" }] }, { webSearchEnabled: true })
+        .userMessagePayload.web_search_enabled,
+      true,
+    )
+    assert.equal(webSearchDefaultEnabled(), false)
+  } finally {
+    if (prev === undefined) delete process.env.MAGPIE_QUICK_WEB_SEARCH
+    else process.env.MAGPIE_QUICK_WEB_SEARCH = prev
+  }
+})
+
+test("system instructions survive the overflow pipeline: anchor inline, full text in an attachment", async () => {
+  const pad = (n) => "（性格补充：温和机敏，先问再答）。".repeat(n)
+  // Large enough that it cannot ride inline whole: this is the frame Stage 3 has
+  // to trim, which is the case that used to lose the text silently.
+  const SYS = "SYSTEM-HEAD-MARKER 【人设：红白】PERSONA-KEY-RULE 自称红白 " + pad(4000) + " SYSTEM-TAIL-MARKER"
+
+  // Case A: a system prompt too large for the frame with a one-line user
+  // message. Stage 4 never engages here, so only Stage 3's spill saves it.
+  const small = openaiToSncsRequest({ model: "balanced", messages: [{ role: "system", content: SYS }, { role: "user", content: "短问" }] }, {})
+  const smallWire = buildAidpInputFrame({ type: "user_message", payload: small.userMessagePayload }).byteLength
+  assert.ok(smallWire <= MAX_USER_MESSAGE_FRAME_BYTES, `frame must stay within budget, got ${smallWire}`)
+  const smallText = small.userMessagePayload.text
+  assert.ok(smallText.includes("<instructions>"), "the instruction block must never disappear")
+  assert.ok(smallText.includes("SYSTEM-HEAD-MARKER"), "a head anchor must ride inline")
+  assert.match(smallText, /attached_files\/system_instructions\.txt lines \d+-\d+/i, "the frame must point at the attachment")
+  assert.ok(small.sysAttachmentText.includes("PERSONA-KEY-RULE"), "middle content survives only in the attachment")
+  assert.ok(small.sysAttachmentText.includes("SYSTEM-TAIL-MARKER"))
+  assert.equal(small.sysAttachmentText, SYS, "the attachment must carry the verbatim original")
+  assert.equal(small.systemDelivered, true)
+
+  // Case B: a large CJK final turn alongside the system prompt.
+  let finalTurn = "【时间线注入】"
+  while (finalTurn.length < 27_000) finalTurn += "时间线条目内容含元思考链片段。"
+  const big = openaiToSncsRequest({ model: "balanced", messages: [{ role: "system", content: SYS }, { role: "user", content: finalTurn }] }, {})
+  const bigText = big.userMessagePayload.text
+  const bigWire = buildAidpInputFrame({ type: "user_message", payload: big.userMessagePayload }).byteLength
+  assert.ok(bigWire <= MAX_USER_MESSAGE_FRAME_BYTES, `frame must stay within budget, got ${bigWire}`)
+  assert.ok(bigText.includes("<instructions>"))
+  assert.ok(bigText.includes("SYSTEM-HEAD-MARKER"))
+  const deliveredSys = bigText.includes("PERSONA-KEY-RULE") || (big.sysAttachmentText || "").includes("PERSONA-KEY-RULE")
+  assert.ok(deliveredSys, "the persona rule must reach the model through the frame or the attachment")
+  assert.ok(big.systemDelivered)
+})
+
+test("system attachment is generated whenever Stage 3 trims the system prompt, even with a huge system and a short turn", async () => {
+  const pad = (n) => "（规则条目）。".repeat(n)
+  const SYS = "BIG-SYS-HEAD " + pad(4000) + " BIG-SYS-MID " + pad(4000) + " BIG-SYS-TAIL"
+  const plan = openaiToSncsRequest({ model: "balanced", messages: [{ role: "system", content: SYS }, { role: "user", content: "hi" }] }, {})
+  assert.ok(plan.sysAttachmentText.length > 0, "a trimmed system prompt must be spilled to an attachment")
+  assert.equal(plan.sysAttachmentText, SYS)
+  assert.match(plan.sysAttachmentRange.name, /^system_instructions\.txt$/)
+  assert.equal(plan.sysAttachmentRange.startLine, 1)
+  assert.equal(plan.sysAttachmentRange.endLine, SYS.split("\n").length)
+  const wire = buildAidpInputFrame({ type: "user_message", payload: plan.userMessagePayload }).byteLength
+  assert.ok(wire <= MAX_USER_MESSAGE_FRAME_BYTES, `frame must stay within budget, got ${wire}`)
+
+  // An untrimmed system prompt allocates no attachment at all.
+  const plain = openaiToSncsRequest({ model: "balanced", messages: [{ role: "system", content: "SHORT SYS" }, { role: "user", content: "hi" }] }, {})
+  assert.equal(plain.sysAttachmentText, "")
+  assert.equal(plain.sysAttachmentRange, null)
+  assert.equal(plain.systemDelivered, true)
+})
+
+test("a thread that never received its system prompt is repaired on the next resume", async () => {
+  const store = createThreadStore()
+  const acct = { providerType: "social", access: "tok-heal", tenantUrl: "https://qbs-heal.plato.ai.aws.dev", accountId: "heal" }
+  const sent = []
+  const WS = makeMockWebSocketClass((ws) => {
+    ws.readyState = 1
+    ws.onopen?.()
+    queueMicrotask(() => {
+      for (const raw of ws.sent) {
+        const outer = JSON.parse(Buffer.from(raw).toString("utf8"))
+        const inner = JSON.parse(Buffer.from(outer.payload.payload, "base64").toString("utf8"))
+        if (inner.type === "user_message") sent.push(inner.payload)
+      }
+      ws.emitAidpEvent({ type: "session_established", payload: {} })
+      ws.emitAidpEvent({ type: "text_delta", payload: { delta: "ok" } })
+      ws.emitAidpEvent({ type: "message_complete", payload: {} })
+    })
+  })
+  const uploader = async (_a, file) => ({
+    type: "file",
+    name: file.name,
+    size: file.bytes.byteLength,
+    mimeType: file.mimeType,
+    path: `/workspace/attached_files/${file.name}`,
+    attachmentId: "att-sys",
+    contentSha256: "sha-sys",
+  })
+  const pad = (n) => "（性格补充）。".repeat(n)
+  // Too large to ever ride inline: the only whole copy is the attachment.
+  const SYS = "HEAL-HEAD 【人设：红白】" + pad(4000) + " HEAL-TAIL"
+  let bigTurn = "【时间线】"
+  while (bigTurn.length < 27_000) bigTurn += "条目内容。"
+  const run = (msgs) => {
+    sent.length = 0
+    return executeSncsChat(acct, { model: "balanced", stream: false, messages: msgs }, {
+      WebSocket: WS,
+      threadStore: store,
+      stateful: true,
+      disableAttachments: false,
+      uploadAttachment: uploader,
+    })
+  }
+
+  // T1: the system prompt is trimmed, so only the attachment carries it whole.
+  await run([{ role: "system", content: SYS }, { role: "user", content: bigTurn }])
+  const t1 = sent[sent.length - 1]
+  assert.ok(t1.text.includes("<instructions>"), "T1 keeps an inline instruction block")
+  assert.ok((t1.attachments || []).some((a) => a.name === "system_instructions.txt"), "T1 uploads the full system text")
+  assert.ok(t1.text.includes("HEAL-HEAD"))
+
+  // T2: the thread never held the text inline, so it must be re-sent in full.
+  await run([{ role: "system", content: SYS }, { role: "user", content: bigTurn }, { role: "assistant", content: "ok" }, { role: "user", content: "再来一句" }])
+  const t2 = sent[sent.length - 1]
+  assert.ok(t2.text.includes("<instructions>"), "T2 must resend the instructions the thread never received inline")
+  assert.ok(t2.text.includes("HEAL-HEAD"), "T2 carries the system text itself")
+
+  // Once the thread actually holds the text inline, later resumes must go back
+  // to plain incremental turns. A smaller prompt is used here because the huge
+  // one above can never fit in a single frame, so it would legitimately keep
+  // being re-sent every turn.
+  const SMALL = "HEAL-HEAD 【人设：红白】" + pad(120) + " HEAL-TAIL"
+  const runSmall = (msgs) => {
+    sent.length = 0
+    return executeSncsChat(acct, { model: "balanced", stream: false, messages: msgs }, {
+      WebSocket: WS,
+      threadStore: store,
+      stateful: true,
+      disableAttachments: false,
+      uploadAttachment: uploader,
+    })
+  }
+  await runSmall([{ role: "system", content: SMALL }, { role: "user", content: "第一句" }])
+  const fresh = sent[sent.length - 1]
+  assert.ok(fresh.text.includes("HEAL-HEAD"), "a fresh thread carries the prompt inline")
+  await runSmall([
+    { role: "system", content: SMALL },
+    { role: "user", content: "第一句" },
+    { role: "assistant", content: "ok" },
+    { role: "user", content: "第二句" },
+  ])
+  const repaired = sent[sent.length - 1]
+  assert.ok(!repaired.text.includes("<instructions>"), "an inline-delivered thread must not resend on every turn")
+  assert.ok(!repaired.text.includes("<system_context_update>"), "and must not emit an empty diff either")
+})
+
+test("a failed system-attachment upload drops the pointer instead of naming a missing file", async () => {
+  const sent = []
+  const WS = makeMockWebSocketClass((ws) => {
+    ws.readyState = 1
+    ws.onopen?.()
+    queueMicrotask(() => {
+      for (const raw of ws.sent) {
+        const outer = JSON.parse(Buffer.from(raw).toString("utf8"))
+        const inner = JSON.parse(Buffer.from(outer.payload.payload, "base64").toString("utf8"))
+        if (inner.type === "user_message") sent.push(inner.payload)
+      }
+      ws.emitAidpEvent({ type: "session_established", payload: {} })
+      ws.emitAidpEvent({ type: "text_delta", payload: { delta: "ok" } })
+      ws.emitAidpEvent({ type: "message_complete", payload: {} })
+    })
+  })
+  const pad = (n) => "（性格补充）。".repeat(n)
+  const SYS = "SYS-HEAD 【人设】" + pad(4000) + " SYS-TAIL"
+  const failingUploader = async (_a, file) => {
+    if (file.name === "system_instructions.txt") throw new Error("DLP blocked")
+    return {
+      type: "file",
+      name: file.name,
+      size: file.bytes.byteLength,
+      mimeType: file.mimeType,
+      path: `/workspace/attached_files/${file.name}`,
+      attachmentId: "att-ok",
+      contentSha256: "sha-ok",
+    }
+  }
+  const acct = { providerType: "social", access: "tok-nofile", tenantUrl: "https://qbs-nofile.plato.ai.aws.dev", accountId: "nofile" }
+  await executeSncsChat(acct, { model: "balanced", stream: false, messages: [{ role: "system", content: SYS }, { role: "user", content: "hi" }] }, {
+    WebSocket: WS,
+    threadStore: createThreadStore(),
+    stateful: true,
+    disableAttachments: false,
+    uploadAttachment: failingUploader,
+  })
+  const frame = sent[sent.length - 1]
+  assert.deepEqual(frame.attachments || [], [], "the failed file must not be advertised")
+  assert.ok(!/system_instructions\.txt/.test(frame.text), "no pointer may survive a failed upload")
+  assert.ok(frame.text.includes("SYS-HEAD"), "the anchor still gives the model its persona")
+})
+
+test("Stage 5 keeps the Stage 4 line references and droppedRange when it adds the system pointer", async () => {
+  const pad = (n) => "（性格补充）。".repeat(n)
+  const SYS = "SYS-HEAD " + pad(3500) + " SYS-TAIL"
+  const msgs = [{ role: "system", content: SYS }]
+  for (let i = 0; i < 60; i++) {
+    msgs.push({ role: "user", content: "历史提问 " + i + " " + "内容".repeat(60) })
+    msgs.push({ role: "assistant", content: "历史回答 " + i + " " + "回复".repeat(60) })
+  }
+  msgs.push({ role: "user", content: "尾部 " + "尾部内容".repeat(5000) })
+  const plan = openaiToSncsRequest({ model: "balanced", messages: msgs }, {})
+
+  // Both attachments exist, so both sets of line references must survive.
+  assert.ok(plan.overflowUserText.includes("DROPPED EARLIER HISTORY"))
+  assert.ok(plan.sysAttachmentText.includes("SYS-HEAD"))
+  assert.ok(plan.textWithAttachmentNote, "the attachment variant of the frame must exist")
+
+  // prompt_context line refs: the dropped-history range and the per-message range
+  assert.match(plan.textWithAttachmentNote, /Omitted earlier history is in lines \d+-\d+/)
+  assert.match(plan.textWithAttachmentNote, /attached file prompt_context_[a-z0-9]+\.txt lines \d+-\d+/i)
+  // system_instructions line ref, in BOTH frame variants
+  assert.match(plan.textWithAttachmentNote, /system_instructions\.txt lines \d+-\d+/)
+  assert.match(plan.userMessagePayload.text, /system_instructions\.txt lines \d+-\d+/)
+
+  const wire = buildAidpInputFrame({ type: "user_message", payload: plan.userMessagePayload }).byteLength
+  const wireNote = buildAidpInputFrame({
+    type: "user_message",
+    payload: { ...plan.userMessagePayload, text: plan.textWithAttachmentNote },
+  }).byteLength
+  assert.ok(wire <= MAX_USER_MESSAGE_FRAME_BYTES, `plain frame within budget, got ${wire}`)
+  assert.ok(wireNote <= MAX_USER_MESSAGE_FRAME_BYTES, `note frame within budget, got ${wireNote}`)
+})
+
+test("an uploaded system_instructions.txt always has an inline pointer, even near the frame limit", async () => {
+  const pad = (n) => "（性格补充）。".repeat(n)
+  let withAttachment = 0
+  // Sweep the band where Stage 3 lands just under the limit and Stage 4 does not
+  // engage: the pointer used to be dropped silently there, orphaning the upload.
+  for (let repeat = 3000; repeat <= 4200; repeat += 40) {
+    for (const tailLen of [500, 2000, 4000, 8000]) {
+      const SYS = "SYS-HEAD " + pad(repeat) + " SYS-TAIL"
+      let tail = "尾"
+      while (tail.length < tailLen) tail += "尾部内容"
+      const plan = openaiToSncsRequest({ model: "balanced", messages: [{ role: "system", content: SYS }, { role: "user", content: tail }] }, {})
+      const text = plan.userMessagePayload.text || ""
+      const wire = buildAidpInputFrame({ type: "user_message", payload: plan.userMessagePayload }).byteLength
+      assert.ok(wire <= MAX_USER_MESSAGE_FRAME_BYTES, `frame within budget at repeat=${repeat} tail=${tailLen}, got ${wire}`)
+      if (!plan.sysAttachmentText) continue
+      withAttachment++
+      assert.match(
+        text,
+        /system_instructions\.txt lines \d+-\d+/,
+        `the upload must be announced in the frame (repeat=${repeat} tail=${tailLen})`,
+      )
+      assert.ok(text.includes("SYS-HEAD"), "the anchor must survive too")
+      if (plan.textWithAttachmentNote) {
+        const wireNote = buildAidpInputFrame({
+          type: "user_message",
+          payload: { ...plan.userMessagePayload, text: plan.textWithAttachmentNote },
+        }).byteLength
+        assert.ok(wireNote <= MAX_USER_MESSAGE_FRAME_BYTES, `note frame within budget, got ${wireNote}`)
+      }
+    }
+  }
+  assert.ok(withAttachment > 0, "the sweep must actually produce attachments")
+})
+test("carrier agent ids persist across restarts, survive time, and clear on forget", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "carrier-store-"))
+  const cacheFile = join(dir, "carrier-agents.json")
+  const acct = { providerType: "social", access: "tok", tenantUrl: "https://qbs-persist.plato.ai.aws.dev", accountId: "persist" }
+  const key = agentAccountKey(acct)
+  const rpcReturning = (agentId, counter) => async () => {
+    if (counter) counter.n++
+    const inner = JSON.stringify({
+      statusCode: 200,
+      body: JSON.stringify({ frames: [{ type: "agent_draft_created", payload: { agent_id: agentId } }] }),
+    })
+    return new Response(JSON.stringify({ eventResponse: { invokeAgentResponse: inner } }), { status: 200 })
+  }
+  try {
+    // First run: creates the draft and writes it to disk.
+    const first = createAgentStore({ cacheFile })
+    const created = await ensureCarrierAgent(acct, { agentMode: "carrier", agentStore: first, fetch: rpcReturning("agent-persist-1") })
+    assert.equal(created, "agent-persist-1")
+    const onDisk = JSON.parse(readFileSync(cacheFile, "utf8"))
+    assert.equal(onDisk.agents[key].agentId, "agent-persist-1")
+
+    // Simulated restart: a new store reads the file and reuses the id without
+    // creating another draft (each draft costs a max_custom_agents slot).
+    const counter = { n: 0 }
+    const restarted = createAgentStore({ cacheFile })
+    const reused = await ensureCarrierAgent(acct, {
+      agentMode: "carrier",
+      agentStore: restarted,
+      fetch: rpcReturning("agent-should-not-be-created", counter),
+    })
+    assert.equal(reused, "agent-persist-1")
+    assert.equal(counter.n, 0, "a restart must not create a second draft")
+
+    // No time-based expiry: a success is reused indefinitely.
+    const later = Date.now() + 30 * 24 * 3600_000
+    assert.equal(restarted.peek(key, later), "agent-persist-1")
+
+    // forget clears memory and disk; the next turn rebuilds instead of reusing.
+    restarted.forget(key)
+    assert.equal(restarted.peek(key), "")
+    assert.deepEqual(JSON.parse(readFileSync(cacheFile, "utf8")).agents, {})
+    // A rebuilt id comes from a real create_agent_draft call, not from storage.
+    const again = await ensureCarrierAgent(acct, {
+      agentMode: "carrier",
+      agentStore: restarted,
+      fetch: rpcReturning("agent-persist-2"),
+    })
+    assert.equal(again, "agent-persist-2")
+    assert.equal(JSON.parse(readFileSync(cacheFile, "utf8")).agents[key].agentId, "agent-persist-2")
+
+    // Failures are negative-cached in memory but never written to disk.
+    const failing = createAgentStore({ cacheFile: join(dir, "fail.json") })
+    await ensureCarrierAgent(acct, {
+      agentMode: "carrier",
+      agentStore: failing,
+      fetch: async () => {
+        throw new Error("agent service unavailable")
+      },
+    })
+    assert.equal(failing.failed(key), true)
+    assert.equal(existsSync(join(dir, "fail.json")), false, "a failure must not create a cache file")
+
+    // A corrupt cache file is ignored rather than fatal.
+    writeFileSync(cacheFile, "{ not json")
+    const tolerant = createAgentStore({ cacheFile })
+    assert.equal(tolerant.size, 0)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("a dead cached carrier agent is forgotten and the turn retries on the inline path", async () => {
+  const acct = { providerType: "social", access: "tok-dead", tenantUrl: "https://qbs-dead.plato.ai.aws.dev", accountId: "dead" }
+  const key = agentAccountKey(acct)
+  const sent = []
+  // Upstream rejects any turn that carries a chat_agent_id, answers without one.
+  const WS = makeMockWebSocketClass((ws) => {
+    ws.readyState = 1
+    ws.onopen?.()
+    queueMicrotask(() => {
+      let payload = null
+      for (const raw of ws.sent) {
+        const outer = JSON.parse(Buffer.from(raw).toString("utf8"))
+        const inner = JSON.parse(Buffer.from(outer.payload.payload, "base64").toString("utf8"))
+        if (inner.type === "user_message") payload = inner.payload
+      }
+      sent.push(payload)
+      ws.emitAidpEvent({ type: "session_established", payload: {} })
+      if (payload?.chat_agent_id) {
+        ws.emitAidpEvent({ type: "error", payload: { message: "agent not found", status: 400 } })
+        return
+      }
+      ws.emitAidpEvent({ type: "text_delta", payload: { delta: "inline answer" } })
+      ws.emitAidpEvent({ type: "message_complete", payload: {} })
+    })
+  })
+  const store = createAgentStore({ cacheFile: "" })
+  store.remember(key, "agent-DEAD")
+
+  const res = await executeSncsChat(
+    acct,
+    { model: "fast", stream: false, messages: [{ role: "system", content: "SYS" }, { role: "user", content: "hi" }] },
+    { WebSocket: WS, threadStore: createThreadStore(), stateful: true, agentStore: store, agentMode: "carrier" },
+  )
+  const json = await res.json()
+  assert.equal(json.choices[0].message.content, "inline answer", "the turn must still be answered")
+
+  assert.equal(sent.length, 2, "the dead agent is tried once, then retried without it")
+  assert.equal(sent[0].chat_agent_id, "agent-DEAD")
+  assert.equal(sent[1].chat_agent_id, null, "the retry must not carry the dead id")
+  assert.ok(!("use_draft" in sent[1]), "and must not ask for a draft agent")
+  assert.equal(store.peek(key), "", "the dead id must be forgotten so the next turn rebuilds")
+})
+
+test("a 401 during a carrier turn is not treated as a dead agent", async () => {
+  const acct = { providerType: "social", access: "tok-auth", tenantUrl: "https://qbs-auth.plato.ai.aws.dev", accountId: "auth" }
+  const key = agentAccountKey(acct)
+  const store = createAgentStore({ cacheFile: "" })
+  store.remember(key, "agent-AUTH")
+  let attempts = 0
+  const WS = makeMockWebSocketClass((ws) => {
+    attempts++
+    ws.readyState = 3
+    ws.onerror?.({ message: "401 Unauthorized" })
+    ws.onclose?.({ code: 1008, reason: "401 Unauthorized" })
+  })
+  await assert.rejects(
+    executeSncsChat(
+      acct,
+      { model: "fast", stream: false, messages: [{ role: "user", content: "hi" }] },
+      { WebSocket: WS, threadStore: createThreadStore(), stateful: true, agentStore: store, agentMode: "carrier" },
+    ),
+    (err) => err.status === 401,
+  )
+  assert.equal(store.peek(key), "agent-AUTH", "an auth failure says nothing about the draft agent")
+  assert.equal(attempts, 1, "and must not trigger the agent-downgrade retry")
 })

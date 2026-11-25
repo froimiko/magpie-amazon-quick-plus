@@ -1,6 +1,6 @@
 {
   "name": "magpie-amazon-quick-plus",
-  "version": "0.3.3",
+  "version": "0.4.2",
   "description": "OpenCode & Magpie plugin for Amazon Quick (AWS Quick / QuickWork) — maintained fork of magpie-amazon-quick: desktop sign-in reuse, OIDC PKCE sign-in, SNCS WebSocket chat bridge, model discovery, and usage tracking",
   "type": "module",
   "main": "./opencode.mjs",
@@ -32,6 +32,7 @@
     "bridge.mjs",
     "codec.mjs",
     "credentials.mjs",
+    "agents.mjs",
     "opencode.mjs",
     "opencode2.mjs",
     "icon.png",
