@@ -328,11 +328,21 @@ async function resolveImageBytes(urlStr, fetchImpl, signal) {
 
 export const MAX_USER_MESSAGE_FRAME_BYTES = 62_000
 const OVERFLOW_ATTACHMENT_RESERVE_BYTES = 800
-// Room every later attachment note needs in the frame: the per-turn overflow note
-// (~376 chars) plus the Stage 5 system pointer (~300 chars), once base64 has
-// inflated them. Budgeting this up front is what lets Stage 3, Stage 4 and the
-// Stage 4 else-if branch coexist instead of pricing each other out.
-const OVERFLOW_NOTE_RESERVE_BYTES = 830
+// Minimal room Stage 5's system-file pointer needs in the frame. The overflow
+// note's own size is measured per turn (see measureNoteBudget) instead of being
+// guessed: it embeds the attachment path and two line numbers, so its length
+// follows the filename and the range rather than any fixed constant.
+const SYSTEM_POINTER_RESERVE_BYTES = 420
+
+/**
+ * Frame bytes the overflow note will occupy for this turn, measured from the real
+ * note text rather than assumed. Line numbers are rendered at their widest so the
+ * estimate cannot come out short of what composeText later emits.
+ */
+function measureNoteBudget(attachmentName) {
+  const widest = { name: attachmentName, startLine: 999_999, endLine: 9_999_999 }
+  return Buffer.byteLength(buildOverflowAttachmentNote(attachmentName, widest), "utf8")
+}
 // How much of a trimmed system prompt still rides inline as an anchor.
 const SYSTEM_ANCHOR_CHARS = 2048
 // Smallest inline system text worth keeping once the attachment pointer must fit.
@@ -1302,9 +1312,10 @@ export function openaiToSncsRequest(body, opts = {}) {
     curBytes = measure(text)
   }
 
-  // Stage 2: Trim/drop ONLY blocks before the protected zone using O(n) arithmetic byte estimates;
-  // preserve paired assistant tool_call block when shifting, leave an omitted-count marker,
-  // and keep full untruncated dropped history for new-thread overflow attachment.
+  // Stage 2: Drop ONLY whole blocks before the protected zone using O(n) arithmetic
+  // byte estimates; preserve the paired assistant tool_call block when shifting,
+  // leave an omitted-count marker, and keep every dropped block untouched so the
+  // overflow attachment can carry it verbatim.
   const droppedBlocks = []
   if (curBytes > maxFrameBytes && protectedStart > 0) {
     const origBlocksByIndex = blocks.map((b) => ({ ...b }))
@@ -1314,15 +1325,11 @@ export function openaiToSncsRequest(body, opts = {}) {
     const estimateFrameBytes = () =>
       emptyBodyFrameBytes + Math.ceil(((totalBlockJsonBytes + Math.max(0, blocks.length - 1) * 4) * 4) / 3) + 16
 
-    for (let i = 0; i < protectedStart && estimateFrameBytes() > maxFrameBytes; i++) {
-      if (blocks[i].text.length > 800) {
-        const trimmed = truncateMiddle(blocks[i].text, 600, { isToolResult: blocks[i].role === "tool" })
-        const nextJsonLen = jsonContentBytes(trimmed)
-        totalBlockJsonBytes += nextJsonLen - blockJsonBytes[i]
-        blockJsonBytes[i] = nextJsonLen
-        blocks[i] = { ...blocks[i], text: trimmed }
-      }
-    }
+    // Old history leaves the frame as WHOLE blocks. Trimming each one in place to
+    // a 600-char stub used to save frame space, but the dropped middle existed in
+    // neither the frame nor the attachment: the block stayed inline as a husk and
+    // was never a spill candidate. Shifting the whole block instead costs a few
+    // more inline messages and puts their complete text in the attachment.
 
     const protectedHasTool = blocks.slice(protectedStart).some((b) => b.role === "tool")
     let shiftLimit =
@@ -1393,7 +1400,9 @@ export function openaiToSncsRequest(body, opts = {}) {
     // Stage 2 may have dropped history that still has to be announced by an
     // attachment note, and Stage 5 may still have to announce the system file:
     // both notes must fit, so hold their space back before sizing the inline text.
-    const noteReserve = historyWillNeedNote ? OVERFLOW_NOTE_RESERVE_BYTES : 0
+    const noteReserve = historyWillNeedNote
+      ? Math.ceil((measureNoteBudget(overflowAttachmentName) + SYSTEM_POINTER_RESERVE_BYTES) * 1.34)
+      : 0
     let sysBudget = Math.floor((maxFrameBytes - noteReserve - withoutSysBytes) * 0.65)
     if (sysBudget > 256) {
       sysText = truncateMiddle(origSysText, sysBudget)
@@ -1512,11 +1521,22 @@ export function openaiToSncsRequest(body, opts = {}) {
     // the attachment already exists, and a block removed from the frame without a
     // line range would be unreachable from both the frame and the file.
     while (over > 0 && protectedStart > 0) {
-      const pushed = blocks[0]
-      blocks.shift()
+      // Never spend the last-resort shift on the omitted-count marker: it is tiny
+      // and it is the only inline notice that earlier turns moved into the file.
+      const dropAt = blocks[0]?.role === "system_note" && protectedStart > 1 ? 1 : 0
+      if (dropAt >= protectedStart) break
+      const pushed = blocks[dropAt]
+      blocks.splice(dropAt, 1)
       protectedStart--
       if (pushed && pushed.role !== "system_note") historyToSpill.push(pushed)
-      const nextDoc = buildOverflowDocument(historyToSpill, blocks.slice(protectedStart), overflowAttachmentName)
+      // The document is rebuilt from the ORIGINAL protected texts, never from the
+      // budget-truncated blocks currently in the frame: the attachment is the one
+      // place a block's complete text survives, so it must not be fed a stub.
+      const nextDoc = buildOverflowDocument(
+        historyToSpill,
+        origProtectedTexts.map((text, k) => ({ text, role: origProtectedRoles[k] })),
+        overflowAttachmentName,
+      )
       overflowUserText = nextDoc.text
       const nextNote = buildOverflowAttachmentNote(overflowAttachmentName, nextDoc.droppedRange)
       buildProtectedVariants(totalBudget)
@@ -1557,10 +1577,14 @@ export function openaiToSncsRequest(body, opts = {}) {
         }
       }
       if (trialProtected <= 0) break
-      const moved = trialBlocks[0]
-      trialBlocks = trialBlocks.slice(1)
+      // Step over the omitted-count marker rather than consuming it: it is tiny,
+      // and it is the only inline notice left if this turn's upload fails and the
+      // frame ships without the attachment note.
+      const from = trialBlocks[0]?.role === "system_note" && trialProtected > 1 ? 1 : 0
+      if (from >= trialProtected) break
+      const moved = trialBlocks[from]
+      trialBlocks = [...trialBlocks.slice(0, from), ...trialBlocks.slice(from + 1)]
       trialProtected--
-      // The omitted-count marker is replaced by the note that announces the file.
       if (moved && moved.role !== "system_note") spill = [...spill, moved]
       doc = buildOverflowDocument(spill, [], overflowAttachmentName)
       note = buildOverflowAttachmentNote(overflowAttachmentName, doc.droppedRange)
@@ -2216,6 +2240,20 @@ export async function executeSncsChat(a, openaiBody, opts = {}) {
  * Used when that upload failed: pointing the model at a file that is not there
  * is worse than saying nothing, because it will try to read it and stall.
  */
+/**
+ * Remove the "the rest is in attached_files/..." overflow note. Used when that
+ * upload failed: the note claims a file the turn does not carry.
+ */
+function stripOverflowNote(text, attachmentName) {
+  const s = String(text || "")
+  const needle = attachmentName || "prompt_context.txt"
+  if (!s.includes(needle)) return s
+  return s
+    .split("\n\n")
+    .filter((part) => !(part.trimStart().startsWith("[Note:") && part.includes(needle)))
+    .join("\n\n")
+}
+
 function stripSystemPointer(text) {
   const s = String(text || "")
   const marker = "[System instructions are long:"
@@ -2325,6 +2363,27 @@ async function runSncsTurn(a, openaiBody, ctx) {
     const expectedOverflowName = reqPlan.overflowAttachmentName || "prompt_context.txt"
     if (reqPlan.textWithAttachmentNote && attachments.some((att) => att?.name === expectedOverflowName)) {
       reqPlan.userMessagePayload.text = reqPlan.textWithAttachmentNote
+    }
+  }
+  // The overflow attachment now carries an unbounded amount of history, so a
+  // failed upload is a realistic outcome (a large file can outrun the upload
+  // timeout). When it does not arrive, the frame must say so: history already
+  // shifted out of the frame is gone, and a bare "[Earlier N ... omitted]" marker
+  // reads as if it were merely trimmed. Name the failure so the model asks for
+  // the missing turn instead of pretending it saw it.
+  const overflowName = reqPlan.overflowAttachmentName || "prompt_context.txt"
+  const overflowMissing =
+    Boolean(reqPlan.overflowUserText) &&
+    opts.uploadLargeText !== false &&
+    !opts.disableAttachments &&
+    !attachments.some((att) => att?.name === overflowName)
+  if (overflowMissing) {
+    const notice =
+      `[Earlier conversation content could not be attached this turn (${overflowName} upload failed), so it is unavailable. If it matters, ask the user to repeat or resend the relevant part.]`
+    const withNotice = (textVal) => (String(textVal || "").trim() ? `${textVal}\n\n${notice}` : notice)
+    reqPlan.userMessagePayload.text = withNotice(reqPlan.userMessagePayload.text)
+    if (reqPlan.textWithAttachmentNote) {
+      reqPlan.textWithAttachmentNote = stripOverflowNote(withNotice(reqPlan.textWithAttachmentNote), overflowName)
     }
   }
   // A pointer to a file the turn failed to upload would be worse than no pointer:

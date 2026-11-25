@@ -3217,6 +3217,158 @@ test("Stage 4's last-resort shift moves blocks into the attachment instead of dr
   assert.ok(wireBytes(plan.userMessagePayload) <= MAX_USER_MESSAGE_FRAME_BYTES, "frame within budget")
 })
 
+
+test("old history is spilled whole instead of being trimmed in place", () => {
+  // Each old message carries a unique middle marker. The pipeline used to shrink
+  // every pre-protected block over 800 chars to a 600-char stub before shifting,
+  // so those middles existed in neither the frame nor the attachment — and no
+  // attachment was produced at all, because nothing looked shifted.
+  const pairs = 12
+  const tags = []
+  const messages = []
+  for (let i = 0; i < pairs; i++) {
+    const tu = `OU${i}`
+    const ta = `OA${i}`
+    tags.push(tu, ta)
+    messages.push({ role: "user", content: `${tu}${"H".repeat(3000)}<<<MID${tu}>>>` })
+    messages.push({ role: "assistant", content: `${ta}${"H".repeat(3000)}<<<MID${ta}>>>` })
+  }
+  messages.push({ role: "user", content: `final ${"f".repeat(2000)}` })
+
+  const plan = openaiToSncsRequest({ model: "balanced", messages })
+  const frame = plan.userMessagePayload.text
+  const lost = tags.filter((t) => !frame.includes(`MID${t}`) && !plan.overflowUserText.includes(`MID${t}`))
+  assert.deepEqual(lost, [], "no message middle may disappear from both frame and attachment")
+  assert.ok(plan.overflowUserText.length > 0, "the evicted history must actually be spilled")
+  assert.ok(wireBytes(plan.userMessagePayload) <= MAX_USER_MESSAGE_FRAME_BYTES, "frame within budget")
+})
+
+test("the overflow attachment is not bounded by the frame budget", () => {
+  // The file carries the complete text no matter how large; only the frame is
+  // capped at MAX_USER_MESSAGE_FRAME_BYTES. A multi-megabyte turn must still be
+  // recoverable in full from the attachment.
+  for (const size of [200_000, 3_000_000]) {
+    const plan = openaiToSncsRequest({
+      model: "balanced",
+      messages: [{ role: "user", content: `HEAD ${"S".repeat(size)} TAILMARK` }],
+    })
+    assert.ok(plan.overflowUserText.length >= size, `the attachment must hold the whole turn (size=${size})`)
+    assert.ok(plan.overflowUserText.includes("TAILMARK"), `the end of the turn must survive (size=${size})`)
+    assert.ok(wireBytes(plan.userMessagePayload) <= MAX_USER_MESSAGE_FRAME_BYTES, `frame stays capped (size=${size})`)
+  }
+})
+
+
+test("a failed overflow upload is announced instead of silently implied", async () => {
+  // The attachment now carries unbounded history, so a large upload can outrun the
+  // upload timeout. When it fails, the frame used to keep a bare "[Earlier N ...
+  // omitted]" marker while claiming nothing about the loss — reading as if the
+  // content were merely trimmed. It must state that the attachment is missing.
+  const sent = []
+  const WS = makeMockWebSocketClass((ws) => {
+    ws.readyState = 1
+    ws.onopen?.()
+    queueMicrotask(() => {
+      for (const raw of ws.sent) {
+        const outer = JSON.parse(Buffer.from(raw).toString("utf8"))
+        const inner = JSON.parse(Buffer.from(outer.payload.payload, "base64").toString("utf8"))
+        if (inner.type === "user_message") sent.push(inner.payload)
+      }
+      ws.emitAidpEvent({ type: "session_established", payload: {} })
+      ws.emitAidpEvent({ type: "text_delta", payload: { delta: "ok" } })
+      ws.emitAidpEvent({ type: "message_complete", payload: {} })
+    })
+  })
+  const acct = { providerType: "social", access: "tok-upfail", tenantUrl: "https://qbs-upfail.plato.ai.aws.dev", accountId: "upfail" }
+  const messages = []
+  for (let i = 0; i < 12; i++) {
+    messages.push({ role: "user", content: `FU${i} ${"u".repeat(3000)}` })
+    messages.push({ role: "assistant", content: `FA${i} ${"a".repeat(3000)}` })
+  }
+  messages.push({ role: "user", content: "final question" })
+
+  await executeSncsChat(acct, { model: "fast", stream: false, messages }, {
+    WebSocket: WS,
+    threadStore: createThreadStore(),
+    disableAttachments: false,
+    uploadAttachment: async () => {
+      throw new Error("upload timed out")
+    },
+  })
+  const frame = sent[sent.length - 1]
+  assert.deepEqual(frame.attachments || [], [], "the failed file must not be advertised")
+  assert.match(frame.text, /\[Earlier \d+ conversation message\(s\) omitted/, "the inline marker stays")
+  assert.ok(!/attached_files/.test(frame.text), "no pointer may name a file that is not there")
+  assert.match(
+    frame.text,
+    /could not be attached this turn/,
+    "the frame must say the history is unavailable rather than implying it was trimmed",
+  )
+})
+
+test("a successful overflow upload still carries the note and the file", async () => {
+  const sent = []
+  const WS = makeMockWebSocketClass((ws) => {
+    ws.readyState = 1
+    ws.onopen?.()
+    queueMicrotask(() => {
+      for (const raw of ws.sent) {
+        const outer = JSON.parse(Buffer.from(raw).toString("utf8"))
+        const inner = JSON.parse(Buffer.from(outer.payload.payload, "base64").toString("utf8"))
+        if (inner.type === "user_message") sent.push(inner.payload)
+      }
+      ws.emitAidpEvent({ type: "session_established", payload: {} })
+      ws.emitAidpEvent({ type: "text_delta", payload: { delta: "ok" } })
+      ws.emitAidpEvent({ type: "message_complete", payload: {} })
+    })
+  })
+  const acct = { providerType: "social", access: "tok-upok", tenantUrl: "https://qbs-upok.plato.ai.aws.dev", accountId: "upok" }
+  const messages = []
+  for (let i = 0; i < 12; i++) {
+    messages.push({ role: "user", content: `FU${i} ${"u".repeat(3000)}` })
+    messages.push({ role: "assistant", content: `FA${i} ${"a".repeat(3000)}` })
+  }
+  messages.push({ role: "user", content: "final question" })
+
+  const uploader = async (_a, file) => ({
+    type: "file",
+    name: file.name,
+    size: file.bytes.byteLength,
+    mimeType: file.mimeType,
+    path: `/workspace/attached_files/${file.name}`,
+    attachmentId: "att-ok",
+    contentSha256: "sha-ok",
+  })
+  await executeSncsChat(acct, { model: "fast", stream: false, messages }, {
+    WebSocket: WS,
+    threadStore: createThreadStore(),
+    disableAttachments: false,
+    uploadAttachment: uploader,
+  })
+  const frame = sent[sent.length - 1]
+  assert.equal((frame.attachments || []).length, 1, "the file must ride on the turn")
+  assert.match(frame.text, /attached_files\/prompt_context_/, "the note must name the file")
+  assert.match(frame.text, /Omitted earlier history is in lines \d+-\d+/, "with its line range")
+  assert.ok(!/could not be attached this turn/.test(frame.text), "a successful upload must not claim failure")
+})
+test("the Stage 5 system pointer is announced next to a spilled history, never instead of it", () => {
+  // The note reserves room measured from the real note text plus a fixed pointer
+  // allowance, so the inline system file pointer and the dropped-history line
+  // range reach the frame together.
+  const system = "前言。" + "（性格补充）。".repeat(3000)
+  const { messages } = longConversation(12, { system })
+  const plan = openaiToSncsRequest({ model: "balanced", messages })
+  const noteVariant = plan.textWithAttachmentNote || ""
+
+  assert.ok(plan.overflowUserText, "history must be spilled")
+  assert.ok(plan.sysAttachmentText, "the trimmed system text must be published")
+  assert.match(noteVariant, /Omitted earlier history is in lines \d+-\d+/, "history line range must survive")
+  assert.match(noteVariant, /system_instructions\.txt lines \d+-\d+/, "the system pointer must be present too")
+  assert.ok(
+    wireBytes({ ...plan.userMessagePayload, text: noteVariant }) <= MAX_USER_MESSAGE_FRAME_BYTES,
+    "the combined note must still fit the frame",
+  )
+})
 test("a swept matrix of long conversations never loses a message and never overshoots the frame", () => {
   let droppedCases = 0
   for (const sysChars of [0, 4_000, 16_000, 32_647]) {
