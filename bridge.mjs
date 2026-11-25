@@ -328,6 +328,11 @@ async function resolveImageBytes(urlStr, fetchImpl, signal) {
 
 export const MAX_USER_MESSAGE_FRAME_BYTES = 62_000
 const OVERFLOW_ATTACHMENT_RESERVE_BYTES = 800
+// Room every later attachment note needs in the frame: the per-turn overflow note
+// (~376 chars) plus the Stage 5 system pointer (~300 chars), once base64 has
+// inflated them. Budgeting this up front is what lets Stage 3, Stage 4 and the
+// Stage 4 else-if branch coexist instead of pricing each other out.
+const OVERFLOW_NOTE_RESERVE_BYTES = 830
 // How much of a trimmed system prompt still rides inline as an anchor.
 const SYSTEM_ANCHOR_CHARS = 2048
 // Smallest inline system text worth keeping once the attachment pointer must fit.
@@ -1362,6 +1367,18 @@ export function openaiToSncsRequest(body, opts = {}) {
     }
   }
 
+  // Declared before Stage 3 so the inline system budget can hold space back for
+  // the attachment notes Stage 4 and its else-if branch may still have to write.
+  const mayAttachOverflow = !opts.disableAttachments && opts.uploadLargeText !== false
+  // History Stage 2 shifted out of the frame. On a resumed thread the delta can
+  // still overflow the frame, and those turns have no earlier history to fall
+  // back on, so they must be spilled the same way a fresh thread's are.
+  // A copy: the else-if branch and Stage 4's last-resort loop append to it as they
+  // push further blocks into the attachment, and that must not feed back into the
+  // Stage 2 omitted-count marker.
+  const historyToSpill = droppedBlocks.slice()
+  const historyWillNeedNote = mayAttachOverflow && historyToSpill.length > 0
+
   // Stage 3: Trim long system prompt text, leaving tools protocol and protected turn intact.
   //
   // The budget is computed from `withoutSysBytes`, which at this point still
@@ -1373,7 +1390,11 @@ export function openaiToSncsRequest(body, opts = {}) {
   let sysTrimmed = false
   if ((!isResume || resendSystem) && curBytes > maxFrameBytes && sysText) {
     const withoutSysBytes = measure(composeText("", toolsText, blocks))
-    let sysBudget = Math.floor((maxFrameBytes - withoutSysBytes) * 0.65)
+    // Stage 2 may have dropped history that still has to be announced by an
+    // attachment note, and Stage 5 may still have to announce the system file:
+    // both notes must fit, so hold their space back before sizing the inline text.
+    const noteReserve = historyWillNeedNote ? OVERFLOW_NOTE_RESERVE_BYTES : 0
+    let sysBudget = Math.floor((maxFrameBytes - noteReserve - withoutSysBytes) * 0.65)
     if (sysBudget > 256) {
       sysText = truncateMiddle(origSysText, sysBudget)
     } else {
@@ -1413,8 +1434,6 @@ export function openaiToSncsRequest(body, opts = {}) {
   let textWithAttachmentNote = ""
   // Set by Stage 4 when it produced the attachment variant of the frame.
   let attachState = null
-  const mayAttachOverflow = !opts.disableAttachments && opts.uploadLargeText !== false
-  const historyToSpill = !isResume ? droppedBlocks : []
 
   if (curBytes > maxFrameBytes && blocks.length) {
     const protectedSlice = blocks.slice(protectedStart)
@@ -1488,22 +1507,84 @@ export function openaiToSncsRequest(body, opts = {}) {
       over = Math.max(measure(text), mayAttachOverflow ? measure(textWithAttachmentNote) : 0) - stage4MaxBytes
     }
 
-    // Last-resort fallback: if a pre-protected block still pushes us over stage4MaxBytes, drop it
+    // Last-resort fallback: a pre-protected block still pushes us over
+    // stage4MaxBytes. Move it into the overflow document instead of dropping it:
+    // the attachment already exists, and a block removed from the frame without a
+    // line range would be unreachable from both the frame and the file.
     while (over > 0 && protectedStart > 0) {
+      const pushed = blocks[0]
       blocks.shift()
       protectedStart--
+      if (pushed && pushed.role !== "system_note") historyToSpill.push(pushed)
+      const nextDoc = buildOverflowDocument(historyToSpill, blocks.slice(protectedStart), overflowAttachmentName)
+      overflowUserText = nextDoc.text
+      const nextNote = buildOverflowAttachmentNote(overflowAttachmentName, nextDoc.droppedRange)
       buildProtectedVariants(totalBudget)
+      const attachBlocks = blocks.slice()
+      textWithAttachmentNote = composeText(sysText, toolsText, attachBlocks, nextNote)
+      attachState = { attachBlocks, attachNote: nextNote, protectedStart }
       over = Math.max(measure(text), mayAttachOverflow ? measure(textWithAttachmentNote) : 0) - stage4MaxBytes
     }
-  } else if (historyToSpill.length > 0 && mayAttachOverflow) {
-    // New thread dropped earlier history in Stage 2 without needing Stage 4 truncation:
-    // still preserve dropped history in the per-turn overflow attachment if the note fits cleanly.
-    const overflowDoc = buildOverflowDocument(historyToSpill, [], overflowAttachmentName)
-    const attachNote = buildOverflowAttachmentNote(overflowAttachmentName, overflowDoc.droppedRange)
-    const candidate = composeText(sysText, toolsText, blocks, attachNote)
-    if (measure(candidate) <= maxFrameBytes - 500) {
-      overflowUserText = overflowDoc.text
+  } else if (historyWillNeedNote) {
+    // History was dropped in Stage 2 without Stage 4 needing to truncate anything.
+    // The note announcing the spill still has to fit, and this branch used to give up
+    // when it did not — the history then vanished from the frame and from every
+    // attachment. Take the room from what the frame still carries instead:
+    //   1. shrink the inline system text (its complete copy becomes
+    //      system_instructions.txt in Stage 5), then
+    //   2. move the oldest pre-protected block into the attachment itself.
+    // Nothing is mutated until a frame that fits has actually been assembled.
+    let trialSys = sysText
+    let trialBlocks = blocks.slice()
+    let trialProtected = protectedStart
+    let spill = historyToSpill.slice()
+    let doc = buildOverflowDocument(spill, [], overflowAttachmentName)
+    let note = buildOverflowAttachmentNote(overflowAttachmentName, doc.droppedRange)
+    let candidate = composeText(trialSys, toolsText, trialBlocks, note)
+    const noteLimit = maxFrameBytes - 500
+    let guard = 0
+    let shrunkSys = false
+    while (measure(candidate) > noteLimit && guard++ < 64) {
+      const over = measure(candidate) - noteLimit
+      if (trialSys.length > SYSPOINTER_MIN_ANCHOR_CHARS) {
+        const keep = Math.max(SYSPOINTER_MIN_ANCHOR_CHARS, trialSys.length - Math.max(256, Math.ceil(over * 1.4)))
+        const next = truncateMiddle(origSysText, keep)
+        if (next !== trialSys) {
+          trialSys = next
+          shrunkSys = true
+          candidate = composeText(trialSys, toolsText, trialBlocks, note)
+          continue
+        }
+      }
+      if (trialProtected <= 0) break
+      const moved = trialBlocks[0]
+      trialBlocks = trialBlocks.slice(1)
+      trialProtected--
+      // The omitted-count marker is replaced by the note that announces the file.
+      if (moved && moved.role !== "system_note") spill = [...spill, moved]
+      doc = buildOverflowDocument(spill, [], overflowAttachmentName)
+      note = buildOverflowAttachmentNote(overflowAttachmentName, doc.droppedRange)
+      candidate = composeText(trialSys, toolsText, trialBlocks, note)
+    }
+    if (measure(candidate) <= noteLimit) {
+      if (shrunkSys) {
+        // The inline text now differs from the caller's original, so Stage 5 must
+        // still publish the full copy and the delivery bookkeeping must know it.
+        sysText = trialSys
+        sysTrimmed = sysText !== origSysText
+      }
+      blocks = trialBlocks
+      protectedStart = trialProtected
+      // Recompute the plain variant last, so its byte figure reflects the blocks
+      // this branch actually settled on.
+      text = composeText(sysText, toolsText, blocks)
+      curBytes = measure(text)
+      overflowUserText = doc.text
       textWithAttachmentNote = candidate
+      // Stage 5 rebuilds the note variant from this state; keeping it (instead of
+      // regenerating a note with droppedRange: null) is what preserves the exact
+      // line range of the spilled history.
+      attachState = { attachBlocks: trialBlocks.slice(), attachNote: note, protectedStart: trialProtected }
     }
   }
 
@@ -1952,6 +2033,22 @@ function isAuthErrorText(msg) {
   return /\b(401|403|unauthorized|unauthenticated|forbidden|invalid.?token|expired.?token|jwt)\b/i.test(String(msg || ""))
 }
 
+// Error text that can only mean the referenced draft agent is gone, not that the
+// transport or the model failed. A websocket reset, an idle timeout or a generic
+// upstream error matches none of these, so it must not cost us a live agent id.
+const AGENT_DEAD_RE =
+  /\b(agent|draft)\b[^\n]{0,40}\b(not[ _-]?found|does not exist|no longer exists|deleted|removed|unknown|invalid)\b|\b(invalid|unknown|missing)[ _-]?(chat[ _-]?)?agent[ _-]?id\b/i
+
+function agentFailureIsAboutAgent(err) {
+  const text = [err?.message, err?.code, err?.errorMessage, err?.cause?.message]
+    .map((v) => String(v ?? ""))
+    .filter(Boolean)
+    .join(" ")
+  if (!text.trim()) return false
+  if (isAuthErrorText(text)) return false
+  return AGENT_DEAD_RE.test(text)
+}
+
 const STRIP_REASONING_ENV = "MAGPIE_QUICK_STRIP_REASONING_CONTENT"
 
 /**
@@ -2084,29 +2181,31 @@ export async function executeSncsChat(a, openaiBody, opts = {}) {
     }
     releaseInflight?.()
 
-    // A cached draft agent the service no longer has (deleted, quota-cleaned, or
-    // created under a previous sign-in) fails the turn before any model output.
-    // Drop the dead id from memory and disk, then retry once with no agent at all
-    // so the caller still gets an answer on the inline <instructions> path.
+    // Only a failure that actually names the draft agent proves the cached id is
+    // dead (deleted, quota-cleaned, created under a previous sign-in). A dropped
+    // websocket, an idle timeout or a generic upstream 5xx says nothing about it,
+    // and treating those as "dead agent" used to discard a live id on the first
+    // network blip — every later turn then silently fell back to the inline path.
     const authLike = err?.status === 401 || err?.status === 403
-    if (chatAgentId && !authLike && !opts.signal?.aborted) {
+    const agentDied = chatAgentId && !authLike && agentFailureIsAboutAgent(err)
+    if (agentDied) {
       try {
         agentStore?.forget?.(accountKey)
       } catch {}
-      // One retry only: the inline path needs no agent, and a second failure is a
-      // real upstream problem the caller should see.
+    }
+    // One retry, on a fresh thread, for the same conversation. The carrier id is
+    // kept unless it was proven dead, so a dropped socket or an idle timeout can
+    // no longer demote the whole session to the inline <instructions> path: the
+    // conversation restarts, the surviving agent still answers it.
+    if (!opts.signal?.aborted && !authLike && (canRetryFresh || chatAgentId)) {
       return await runSncsTurn(a, openaiBody, {
-        ...opts,
-        chatAgentId: null,
+        ...turnOpts,
+        ...(agentDied ? { chatAgentId: null } : {}),
         resumeState: null,
         accountKey,
         threadStore,
         WS,
       })
-    }
-
-    if (canRetryFresh) {
-      return await runSncsTurn(a, openaiBody, { ...turnOpts, resumeState: null, accountKey, threadStore, WS })
     }
     throw err
   }

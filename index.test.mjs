@@ -3070,6 +3070,195 @@ test("an uploaded system_instructions.txt always has an inline pointer, even nea
   }
   assert.ok(withAttachment > 0, "the sweep must actually produce attachments")
 })
+
+// ---------------------------------------------------------------------------
+// Context-loss regression suite: history that Stage 2 drops must always be
+// reachable, either inline or through the per-turn overflow attachment. The
+// reported failure was a 32,647-character system prompt plus 94 history
+// messages: Stage 3 shrank the system text just under the limit, Stage 4 then
+// never engaged, and its else-if branch gave up because the announcement note
+// did not fit — so all 94 messages disappeared without a trace.
+// ---------------------------------------------------------------------------
+
+const wireBytes = (payload) =>
+  buildAidpInputFrame({ type: "user_message", payload }).byteLength
+
+/** System prompt of exactly `chars` characters with a chosen UTF-8 byte budget. */
+function sizedSystem(chars, targetBytes) {
+  const wide = "规则：必须保持人设与语言一致。"
+  const narrow = "Rule: keep the persona and language stable. "
+  let out = ""
+  while (out.length < chars) {
+    const room = chars - out.length
+    if (room <= 0) break
+    out += (targetBytes - Buffer.byteLength(out, "utf8")) / room > 1.5 ? wide : narrow
+  }
+  return out.slice(0, chars)
+}
+
+function longConversation(pairs, { system = "", marker = (i) => `M${i}` } = {}) {
+  const messages = []
+  if (system) messages.push({ role: "system", content: system })
+  const tags = []
+  for (let i = 0; i < pairs; i++) {
+    const u = `${marker(i)}U`, a = `${marker(i)}A`
+    tags.push(u, a)
+    messages.push({ role: "user", content: `${u} 第${i + 1}个问题：请分析这个项目里的模块依赖关系，并说明主要风险点在哪里。` })
+    messages.push({ role: "assistant", content: `${a} 第${i + 1}个回答：该项目主要分为三个层次，依赖方向自上而下，主要风险在于层间耦合。` })
+  }
+  messages.push({ role: "user", content: `${marker("final")} 接着上面的继续` })
+  tags.push(marker("final"))
+  return { messages, tags }
+}
+
+test("dropped history always reaches the overflow attachment instead of vanishing", () => {
+  // The exact reported shape: 32,647 chars / 61,593 bytes of system prompt.
+  const system = sizedSystem(32_647, 61_593)
+  assert.equal(system.length, 32_647)
+  const { messages, tags } = longConversation(47, { system })
+  const plan = openaiToSncsRequest({ model: "balanced", messages })
+  const frame = plan.userMessagePayload.text
+
+  const omitted = Number((frame.match(/\[Earlier (\d+) conversation message\(s\) omitted/) || [])[1] || 0)
+  assert.ok(omitted > 0, "the scenario must actually drop history")
+  assert.match(plan.overflowUserText, /=== DROPPED EARLIER HISTORY/, "dropped history must be spilled")
+  assert.ok(plan.overflowUserText.includes(tags[0]), "the oldest message must be in the attachment")
+  assert.ok(plan.overflowUserText.includes(tags[tags.length - 2]), "and so must the last history message")
+
+  // Every marker is reachable somewhere: inline or in a file the turn uploads.
+  const reachable = (m) => frame.includes(m) || plan.overflowUserText.includes(m)
+  assert.deepEqual(tags.filter((m) => !reachable(m)), [], "no message may be lost from both frame and attachment")
+
+  // Both notes fit the real frame budget.
+  assert.ok(plan.sysAttachmentText, "the full system text must still be published")
+  assert.match(plan.textWithAttachmentNote, /system_instructions\.txt lines \d+-\d+/, "the system pointer must survive")
+  assert.ok(wireBytes(plan.userMessagePayload) <= MAX_USER_MESSAGE_FRAME_BYTES, "plain frame within budget")
+  assert.ok(
+    wireBytes({ ...plan.userMessagePayload, text: plan.textWithAttachmentNote }) <= MAX_USER_MESSAGE_FRAME_BYTES,
+    "note frame within budget",
+  )
+})
+
+test("the spill note keeps its dropped-range line reference through Stage 5", () => {
+  // Stage 3 trims the system prompt AND history is dropped AND Stage 4 does not
+  // engage: the else-if branch spills the history, Stage 5 then rebuilds the
+  // note. It used to rebuild it with droppedRange: null, dropping the line ref.
+  const system = "前言。" + "（性格补充）。".repeat(3000)
+  const { messages } = longConversation(10, { system })
+  const plan = openaiToSncsRequest({ model: "balanced", messages })
+
+  assert.ok(plan.sysAttachmentText, "Stage 5 must publish the trimmed system text")
+  assert.match(plan.overflowUserText, /=== DROPPED EARLIER HISTORY/, "history must be spilled")
+  assert.match(
+    plan.textWithAttachmentNote,
+    /Omitted earlier history is in lines \d+-\d+/,
+    "the rebuilt note must still point at the exact line range",
+  )
+})
+
+test("a resumed turn's dropped delta is spilled too, not only a fresh thread's", () => {
+  // Turn 2+ sends only the delta. When that delta alone overflows, Stage 2 drops
+  // from it, and a resumed turn has no earlier history to fall back on.
+  const big = "溢出内容".repeat(8000)
+  const deltaMessages = [
+    { role: "user", content: `RSU1 ${big}` },
+    { role: "assistant", content: `RSA1 ${big}` },
+    { role: "user", content: `RSU2 ${big}` },
+    { role: "tool", tool_call_id: "z", name: "read_file", content: `RSTB ${big}` },
+  ]
+  const plan = openaiToSncsRequest(
+    { model: "balanced", messages: [] },
+    {
+      resumeState: {
+        threadId: "t-resume",
+        deltaMessages,
+        systemUpdate: "",
+        toolsChanged: false,
+        prevToolMap: null,
+        lang: "en",
+        deliveredSysText: "SYS",
+        allHashes: [],
+        toolsSig: "sig",
+      },
+    },
+  )
+  const frame = plan.userMessagePayload.text
+  assert.equal(plan.isResume, true)
+  assert.match(frame, /\[Earlier \d+ conversation message\(s\) omitted/, "the delta must overflow")
+  assert.match(plan.overflowUserText, /=== DROPPED EARLIER HISTORY/, "the dropped delta must be spilled")
+  assert.ok(plan.overflowUserText.includes("RSU1"), "the first dropped delta message must be recoverable")
+  assert.ok(wireBytes(plan.userMessagePayload) <= MAX_USER_MESSAGE_FRAME_BYTES, "frame within budget")
+})
+
+test("Stage 4's last-resort shift moves blocks into the attachment instead of dropping them", () => {
+  // The protected turn alone is huge, so Stage 4's final loop has to push
+  // pre-protected blocks out. Dropping them left them in neither place.
+  const messages = [
+    { role: "user", content: `KEEP_U1 ${"u".repeat(30_000)}` },
+    { role: "assistant", content: `KEEP_A1 ${"a".repeat(30_000)}` },
+    { role: "user", content: `KEEP_U2 ${"u".repeat(30_000)}` },
+    {
+      role: "assistant",
+      content: null,
+      tool_calls: [{ id: "k", type: "function", function: { name: "read_file", arguments: "{}" } }],
+    },
+    { role: "tool", tool_call_id: "k", name: "read_file", content: `HUGE_TOOL ${"t".repeat(70_000)}` },
+  ]
+  const plan = openaiToSncsRequest({ model: "balanced", messages })
+  const frame = plan.userMessagePayload.text
+  for (const tag of ["KEEP_U1", "KEEP_A1", "KEEP_U2"]) {
+    assert.ok(
+      frame.includes(tag) || plan.overflowUserText.includes(tag),
+      `${tag} must stay reachable from the frame or the attachment`,
+    )
+  }
+  assert.match(plan.overflowUserText, /=== DROPPED EARLIER HISTORY/, "the shifted blocks need a section")
+  assert.match(plan.textWithAttachmentNote, /Omitted earlier history is in lines \d+-\d+/, "with a line range")
+  assert.ok(wireBytes(plan.userMessagePayload) <= MAX_USER_MESSAGE_FRAME_BYTES, "frame within budget")
+})
+
+test("a swept matrix of long conversations never loses a message and never overshoots the frame", () => {
+  let droppedCases = 0
+  for (const sysChars of [0, 4_000, 16_000, 32_647]) {
+    for (const pairs of [5, 20, 47]) {
+      for (const msgChars of [200, 1_500, 4_000]) {
+        const system = sysChars ? ("规则。" + "内置规则。".repeat(sysChars)).slice(0, sysChars) : ""
+        const messages = []
+        if (system) messages.push({ role: "system", content: system })
+        const tags = []
+        for (let i = 0; i < pairs; i++) {
+          const u = `WU${i}`, a = `WA${i}`
+          tags.push(u, a)
+          messages.push({ role: "user", content: `${u} ${"问".repeat(Math.ceil(msgChars / 3))}` })
+          messages.push({ role: "assistant", content: `${a} ${"答".repeat(Math.ceil(msgChars / 3))}` })
+        }
+        messages.push({ role: "user", content: "WFINAL 接着上面的继续" })
+        tags.push("WFINAL")
+
+        const plan = openaiToSncsRequest({ model: "balanced", messages })
+        const frame = plan.userMessagePayload.text
+        if (/\[Earlier \d+ conversation message\(s\) omitted/.test(frame)) droppedCases++
+        const lost = tags.filter((m) => !frame.includes(m) && !plan.overflowUserText.includes(m))
+        assert.deepEqual(
+          lost,
+          [],
+          `sys=${sysChars} pairs=${pairs} msg=${msgChars}: unreachable messages`,
+        )
+        assert.ok(
+          wireBytes(plan.userMessagePayload) <= MAX_USER_MESSAGE_FRAME_BYTES,
+          `sys=${sysChars} pairs=${pairs} msg=${msgChars}: plain frame over budget`,
+        )
+        if (plan.textWithAttachmentNote) {
+          assert.ok(
+            wireBytes({ ...plan.userMessagePayload, text: plan.textWithAttachmentNote }) <= MAX_USER_MESSAGE_FRAME_BYTES,
+            `sys=${sysChars} pairs=${pairs} msg=${msgChars}: note frame over budget`,
+          )
+        }
+      }
+    }
+  }
+  assert.ok(droppedCases > 0, "the sweep must actually exercise dropped history")
+})
 test("carrier agent ids persist across restarts, survive time, and clear on forget", async () => {
   const dir = mkdtempSync(join(tmpdir(), "carrier-store-"))
   const cacheFile = join(dir, "carrier-agents.json")
@@ -3184,6 +3373,89 @@ test("a dead cached carrier agent is forgotten and the turn retries on the inlin
   assert.equal(store.peek(key), "", "the dead id must be forgotten so the next turn rebuilds")
 })
 
+
+test("a transport failure keeps the live carrier agent on a fresh-thread retry", async () => {
+  // A dropped socket or an idle timeout says nothing about the draft agent. It
+  // used to be forgotten anyway, so every later turn silently fell back to the
+  // inline <instructions> path while the agent slot stayed occupied.
+  const acct = { providerType: "social", access: "tok-blip", tenantUrl: "https://qbs-blip.plato.ai.aws.dev", accountId: "blip" }
+  const key = agentAccountKey(acct)
+  const sent = []
+  let attempt = 0
+  const WS = makeMockWebSocketClass((ws) => {
+    attempt++
+    const mine = attempt
+    ws.readyState = 1
+    ws.onopen?.()
+    queueMicrotask(() => {
+      for (const raw of ws.sent) {
+        const outer = JSON.parse(Buffer.from(raw).toString("utf8"))
+        const inner = JSON.parse(Buffer.from(outer.payload.payload, "base64").toString("utf8"))
+        if (inner.type === "user_message") sent.push(inner.payload)
+      }
+      ws.emitAidpEvent({ type: "session_established", payload: {} })
+      if (mine === 1) {
+        ws.onclose?.({ code: 1006, reason: "connection reset" })
+        return
+      }
+      ws.emitAidpEvent({ type: "text_delta", payload: { delta: "ok" } })
+      ws.emitAidpEvent({ type: "message_complete", payload: {} })
+    })
+  })
+  const store = createAgentStore({ cacheFile: "" })
+  store.remember(key, "agent-ALIVE")
+
+  const res = await executeSncsChat(
+    acct,
+    { model: "fast", stream: false, messages: [{ role: "system", content: "SYS" }, { role: "user", content: "hi" }] },
+    { WebSocket: WS, threadStore: createThreadStore(), stateful: true, agentStore: store, agentMode: "carrier" },
+  )
+  await res.json()
+  assert.equal(sent.length, 2, "the turn is retried once")
+  assert.equal(sent[0].chat_agent_id, "agent-ALIVE")
+  assert.equal(sent[1].chat_agent_id, "agent-ALIVE", "the retry must keep the live agent")
+  assert.notEqual(sent[0].thread_id, sent[1].thread_id, "but it starts on a fresh thread")
+  assert.equal(store.peek(key), "agent-ALIVE", "a transport blip must not forget a live agent")
+})
+
+test("an idle timeout keeps the carrier agent; only an agent-specific error forgets it", async () => {
+  const acct = { providerType: "social", access: "tok-to", tenantUrl: "https://qbs-to.plato.ai.aws.dev", accountId: "to" }
+  const key = agentAccountKey(acct)
+  const sent = []
+  let attempt = 0
+  const WS = makeMockWebSocketClass((ws) => {
+    attempt++
+    const mine = attempt
+    ws.readyState = 1
+    ws.onopen?.()
+    queueMicrotask(() => {
+      for (const raw of ws.sent) {
+        const outer = JSON.parse(Buffer.from(raw).toString("utf8"))
+        const inner = JSON.parse(Buffer.from(outer.payload.payload, "base64").toString("utf8"))
+        if (inner.type === "user_message") sent.push(inner.payload)
+      }
+      ws.emitAidpEvent({ type: "session_established", payload: {} })
+      if (mine === 1) {
+        ws.emitAidpEvent({ type: "error", payload: { message: "Amazon Quick WebSocket response timed out", status: 504 } })
+        return
+      }
+      ws.emitAidpEvent({ type: "text_delta", payload: { delta: "ok" } })
+      ws.emitAidpEvent({ type: "message_complete", payload: {} })
+    })
+  })
+  const store = createAgentStore({ cacheFile: "" })
+  store.remember(key, "agent-ALIVE")
+
+  await (
+    await executeSncsChat(
+      acct,
+      { model: "fast", stream: false, messages: [{ role: "user", content: "hi" }] },
+      { WebSocket: WS, threadStore: createThreadStore(), stateful: true, agentStore: store, agentMode: "carrier" },
+    )
+  ).json()
+  assert.equal(sent[1].chat_agent_id, "agent-ALIVE", "a timeout is not a dead agent")
+  assert.equal(store.peek(key), "agent-ALIVE")
+})
 test("a 401 during a carrier turn is not treated as a dead agent", async () => {
   const acct = { providerType: "social", access: "tok-auth", tenantUrl: "https://qbs-auth.plato.ai.aws.dev", accountId: "auth" }
   const key = agentAccountKey(acct)
