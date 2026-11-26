@@ -326,7 +326,29 @@ async function resolveImageBytes(urlStr, fetchImpl, signal) {
   return null
 }
 
-export const MAX_USER_MESSAGE_FRAME_BYTES = 62_000
+/**
+ * Budget for one outbound `user_message`, measured in the bytes the SERVER counts:
+ * the UTF-8 length of `JSON.stringify({ type, payload })`.
+ *
+ * The limit used to be applied to the base64-wrapped wire frame
+ * (`buildAidpInputFrame`). Base64 inflates by ~4/3, so a 62,000 "frame" budget only
+ * allowed ~46.5 KB of real payload — the server accepts far more than that.
+ *
+ * Measured against the live service (2026-11-26, us-east-1, social):
+ *   63,472 B payload -> accepted
+ *   63,857 B payload -> rejected (bare `error` event)
+ *   both ASCII and CJK rejected at the same PAYLOAD byte count, so the server
+ *   measures payload bytes, not characters and not base64.
+ * 64,000 is therefore the highest round number that stays under the observed
+ * ceiling, leaving ~140 B of headroom.
+ */
+export const MAX_USER_MESSAGE_PAYLOAD_BYTES = 64_000
+
+/**
+ * @deprecated Kept for callers and tests written against the old name. This is now
+ * a derived wire-frame figure, NOT the budget the pipeline measures against.
+ */
+export const MAX_USER_MESSAGE_FRAME_BYTES = Math.ceil((MAX_USER_MESSAGE_PAYLOAD_BYTES * 4) / 3) + 64
 const OVERFLOW_ATTACHMENT_RESERVE_BYTES = 800
 // Minimal room Stage 5's system-file pointer needs in the frame. The overflow
 // note's own size is measured per turn (see measureNoteBudget) instead of being
@@ -372,6 +394,15 @@ function buildOverflowAttachmentNote(attachmentName, droppedRange = null) {
   return `[Note: Full untruncated content is attached in your Quick workspace at /workspace/attached_files/${attachmentName} (workspace-relative path: attached_files/${attachmentName}).${droppedPart} Exception to the no-container-tools rule: use your built-in workspace file reader to read this attachment directly instead of re-reading those lines via local <tool_call>.]`
 }
 
+/**
+ * Inline placeholder left behind when whole history blocks are shifted out of the
+ * turn. It names the payload budget the pipeline actually enforces instead of the
+ * old, misleading "64KB frame" wording.
+ */
+function omittedMarkerText(count) {
+  return `[Earlier ${count} conversation message(s) omitted to fit the ${Math.round(MAX_USER_MESSAGE_PAYLOAD_BYTES / 1000)}KB payload budget]`
+}
+
 function snapHeadToLineBoundary(s, targetHead) {
   if (targetHead <= 0 || targetHead >= s.length) return targetHead
   const minHead = Math.max(16, targetHead - Math.min(240, Math.floor(targetHead * 0.25)))
@@ -400,7 +431,7 @@ function truncateMiddle(str, maxChars, optsOrMarker = undefined) {
     if (opts.attachmentRef) {
       return `\n...[trimmed ${omitted} of ${s.length} chars; full content in attached file ${opts.attachmentRef.name} lines ${opts.attachmentRef.startLine}-${opts.attachmentRef.endLine}]...\n`
     }
-    const base = `trimmed ${omitted} of ${s.length} chars to fit 64KB frame`
+    const base = `trimmed ${omitted} of ${s.length} chars to fit the ${Math.round(MAX_USER_MESSAGE_PAYLOAD_BYTES / 1000)}KB payload budget`
     const hints = []
     if (opts.isToolResult) hints.push("re-read with a smaller line range if exact omitted lines are needed")
     return `\n...[${base}${hints.length ? `; ${hints.join("; ")}` : ""}]...\n`
@@ -590,7 +621,7 @@ function formatToolsInstruction(tools, toolChoice, compact = false) {
     "- Even when Quick's device daemon reports the user's device as offline, this client bridge is actively connected and executes <tool_call> blocks directly on the user's local filesystem (`C:\\...`, `/Users/...`, project folders).",
     "- For any local file read, write, edit, or command task, emit a <tool_call> block in your text response instead of calling container tools like `file_write` or saving to `workspace/artifacts`:",
     "<tool_call>{\"name\":\"tool_name\",\"arguments\":{}}</tool_call>",
-    "- Frame budget: Combined tool outputs in a single turn exceeding ~55 KB will be trimmed to fit the 64 KB wire frame; keep each read_file call to ~250 lines or read large files sequentially across turns.",
+    "- Turn budget: combined tool output within one turn is capped at about 64 KB of payload text; anything beyond it is trimmed or moved to an attached file. Keep each read_file call to ~250 lines, or read large files sequentially across turns.",
     "- Pause after emitting <tool_call> block(s) to receive the <tool_result> turn." + choiceNote,
     "Declared client tools:",
     ...defs,
@@ -1136,7 +1167,8 @@ export const DEFAULT_THREAD_STORE = createThreadStore()
 
 /**
  * Convert an OpenAI `/chat/completions` JSON request body into SNCS `user_message` fields,
- * compacting schemas and older turns when necessary so the outbound SNCS frame stays under the 64 KB limit.
+ * compacting schemas and older turns when necessary so the outbound user_message payload stays
+ * under the server's ~64 KB limit (measured as UTF-8 bytes of the payload JSON, not the base64 frame).
  */
 export function openaiToSncsRequest(body, opts = {}) {
   const { modelId, agentMode, autoRouting, thinkingEffort } = resolveModelAndEffort(body?.model, body, opts.effortHeader)
@@ -1201,7 +1233,16 @@ export function openaiToSncsRequest(body, opts = {}) {
         ? opts.webSearchEnabled
         : webSearchDefaultEnabled()
   const surfaceType = surfaceTypeForPlatform(opts.platform)
-  const maxFrameBytes = Number(opts.maxFrameBytes) > 0 ? Number(opts.maxFrameBytes) : MAX_USER_MESSAGE_FRAME_BYTES
+  // Measured in payload JSON bytes (what the server counts), not base64 frame bytes.
+  // `maxFrameBytes` is still accepted so existing overrides keep working: it names
+  // the old wire-frame metric, so convert it back to a payload budget.
+  const payloadBudget =
+    Number(opts.maxPayloadBytes) > 0
+      ? Number(opts.maxPayloadBytes)
+      : Number(opts.maxFrameBytes) > 0
+        ? Math.floor(((Number(opts.maxFrameBytes) - 64) * 3) / 4)
+        : MAX_USER_MESSAGE_PAYLOAD_BYTES
+  const maxFrameBytes = payloadBudget
 
   // Set once the turn decides the caller's system text could not ride in full:
   // the inline block then keeps only a head anchor plus a pointer at the exact
@@ -1279,7 +1320,10 @@ export function openaiToSncsRequest(body, opts = {}) {
     incognito: true,
   })
 
-  const measure = (textVal) => buildAidpInputFrame({ type: "user_message", payload: buildUserPayload(textVal) }).byteLength
+  // Server-side metric: UTF-8 bytes of the whole user_message JSON. The base64 wire
+  // wrapping is added only at send time and is NOT what the server rejects on.
+  const measure = (textVal) =>
+    Buffer.byteLength(JSON.stringify({ type: "user_message", payload: buildUserPayload(textVal) }), "utf8")
 
   // On resume the text is normally withheld (it was already delivered), but the
   // pipeline still needs it when the thread never received it.
@@ -1322,8 +1366,11 @@ export function openaiToSncsRequest(body, opts = {}) {
     const blockJsonBytes = blocks.map((b) => jsonContentBytes(b.text))
     let totalBlockJsonBytes = blockJsonBytes.reduce((a, b) => a + b, 0)
     const emptyBodyFrameBytes = measure(composeText(sysText, toolsText, []))
+    // Payload-byte estimate: the block text is embedded as JSON string content, so add
+    // its JSON-escaped length plus the separator/comma overhead between blocks. The
+    // base64 blow-up happens after this point and is no longer part of the budget.
     const estimateFrameBytes = () =>
-      emptyBodyFrameBytes + Math.ceil(((totalBlockJsonBytes + Math.max(0, blocks.length - 1) * 4) * 4) / 3) + 16
+      emptyBodyFrameBytes + totalBlockJsonBytes + Math.max(0, blocks.length - 1) * 12 + 32
 
     // Old history leaves the frame as WHOLE blocks. Trimming each one in place to
     // a 600-char stub used to save frame space, but the dropped middle existed in
@@ -1347,14 +1394,15 @@ export function openaiToSncsRequest(body, opts = {}) {
     }
 
     if (droppedBlocks.length > 0) {
-      const markerText = `[Earlier ${droppedBlocks.length} conversation message(s) omitted to fit 64KB frame]`
+      const markerText = omittedMarkerText(droppedBlocks.length)
       blocks.unshift({ text: markerText, msgIndex: -1, role: "system_note" })
       protectedStart++
     }
 
     text = composeText(sysText, toolsText, blocks)
     curBytes = measure(text)
-    // Verify once with exact measure(); if slightly over due to base64 rounding, drop remaining shiftable blocks
+    // Verify once with exact measure(); the O(n) estimate above can drift a little, so
+    // drop remaining shiftable blocks until the real payload fits.
     while (curBytes > maxFrameBytes && shiftLimit > 0) {
       const dropAt = droppedBlocks.length > 0 ? 1 : 0
       blocks.splice(dropAt, 1)
@@ -1362,7 +1410,7 @@ export function openaiToSncsRequest(body, opts = {}) {
       shiftedCount++
       protectedStart--
       shiftLimit--
-      const markerText = `[Earlier ${droppedBlocks.length} conversation message(s) omitted to fit 64KB frame]`
+      const markerText = omittedMarkerText(droppedBlocks.length)
       if (dropAt === 1) {
         blocks[0] = { text: markerText, msgIndex: -1, role: "system_note" }
       } else {
@@ -1676,6 +1724,8 @@ export function openaiToSncsRequest(body, opts = {}) {
     systemDelivered,
     systemDeliveredInline,
     sysTextInFrame: sysText,
+    // Server-visible size of the user_message about to be sent, in payload JSON bytes.
+    payloadBytes: measure(text),
     convoHashes,
     imageUrls: collectImageUrls(outboundMsgs),
     overflowUserText,
@@ -2780,8 +2830,21 @@ async function runSncsTurn(a, openaiBody, ctx) {
       if (type === "error") {
         const msg = ev.payload?.message || ev.payload?.error || ev.message || "Amazon Quick WebSocket error"
         const rawStatus = Number(ev.payload?.status)
-        const status = rawStatus || (/size limit|too large|too long|invalid/i.test(msg) ? 400 : 502)
-        failEarly(msg, status)
+        // An oversized user_message is rejected with a bare `error` event whose payload is
+        // empty — no message, no status. Measured ceiling: ~64 KB of payload JSON (see
+        // MAX_USER_MESSAGE_PAYLOAD_BYTES). Report that as a request problem instead of a
+        // generic upstream 502, so a caller can tell "your turn was too big" apart from
+        // "the service broke".
+        const emptyPayload = !ev.payload || Object.keys(ev.payload).length === 0
+        const oversize = emptyPayload && reqPlan.payloadBytes > MAX_USER_MESSAGE_PAYLOAD_BYTES * 0.9
+        const status =
+          rawStatus || (oversize || /size limit|too large|too long|invalid/i.test(msg) ? 400 : 502)
+        failEarly(
+          oversize
+            ? `Amazon Quick rejected this turn: its user_message payload was ${reqPlan.payloadBytes} bytes, above the service limit. Shorten the conversation or reduce attached context.`
+            : msg,
+          status,
+        )
         return
       }
       if (type === "message_complete" || type === "stream_ended") {

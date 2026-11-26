@@ -38,6 +38,7 @@ import {
   createToolCallSplitter,
   executeSncsChat,
   MAX_USER_MESSAGE_FRAME_BYTES,
+  MAX_USER_MESSAGE_PAYLOAD_BYTES,
   modelsFromSettings,
   openaiToSncsRequest,
   resolveModelAndEffort,
@@ -460,8 +461,8 @@ test("model mapping, tool-call splitter, and openaiToSncsRequest handle variants
       { role: "user", content: "Final task: edit_file douban_spider.py now" },
     ],
   })
-  const frameBytes = buildAidpInputFrame({ type: "user_message", payload: hugeReq.userMessagePayload }).byteLength
-  assert.ok(frameBytes <= MAX_USER_MESSAGE_FRAME_BYTES, `Expected frameBytes ${frameBytes} <= ${MAX_USER_MESSAGE_FRAME_BYTES}`)
+  const hugeBytes = payloadBytes(hugeReq.userMessagePayload)
+  assert.ok(hugeBytes <= MAX_USER_MESSAGE_PAYLOAD_BYTES, `Expected payload ${hugeBytes} <= ${MAX_USER_MESSAGE_PAYLOAD_BYTES}`)
   assert.ok(hugeReq.userMessagePayload.text.includes("Final task: edit_file douban_spider.py now"))
   assert.ok(hugeReq.userMessagePayload.text.includes("tool_29(path*: string"))
   assert.ok(hugeReq.userMessagePayload.text.endsWith("</client_tool_directive>"))
@@ -1522,8 +1523,8 @@ test("parallel tool_result blocks in current turn are protected, proportionally 
     ],
   })
 
-  const frameBytes = buildAidpInputFrame({ type: "user_message", payload: fullReq.userMessagePayload }).byteLength
-  assert.ok(frameBytes <= MAX_USER_MESSAGE_FRAME_BYTES, `expected frame <= ${MAX_USER_MESSAGE_FRAME_BYTES}, got ${frameBytes}`)
+  const fullBytes = payloadBytes(fullReq.userMessagePayload)
+  assert.ok(fullBytes <= MAX_USER_MESSAGE_PAYLOAD_BYTES, `expected payload <= ${MAX_USER_MESSAGE_PAYLOAD_BYTES}, got ${fullBytes}`)
 
   const outText = fullReq.userMessagePayload.text
   // Paired assistant tool_call block preserved; older turns dropped
@@ -1547,7 +1548,7 @@ test("parallel tool_result blocks in current turn are protected, proportionally 
   // Informative truncation markers report original length and smaller line-range re-read hint,
   // WITHOUT prematurely claiming prompt_context.txt before upload succeeds
   for (const [id, block] of [["r1", inline1], ["r2", inline2], ["r3", inline3]]) {
-    assert.match(block, /trimmed \d+ of \d+ chars to fit 64KB frame/, `${id} should report original/omitted length`)
+    assert.match(block, /trimmed \d+ of \d+ chars to fit the 64KB payload budget/, `${id} should report original/omitted length`)
     assert.ok(!block.includes("prompt_context.txt"), `${id} must not claim prompt_context.txt before upload succeeds`)
     assert.match(block, /smaller line range/i, `${id} should hint to re-read with smaller line range`)
   }
@@ -1573,16 +1574,24 @@ test("parallel tool_result blocks in current turn are protected, proportionally 
       },
     },
   )
-  const resumeBytes = buildAidpInputFrame({ type: "user_message", payload: resumeReq.userMessagePayload }).byteLength
-  assert.ok(resumeBytes <= MAX_USER_MESSAGE_FRAME_BYTES, `resume frame <= ${MAX_USER_MESSAGE_FRAME_BYTES}, got ${resumeBytes}`)
+  const resumePayloadBytes = payloadBytes(resumeReq.userMessagePayload)
+  assert.ok(resumePayloadBytes <= MAX_USER_MESSAGE_PAYLOAD_BYTES, `resume payload <= ${MAX_USER_MESSAGE_PAYLOAD_BYTES}, got ${resumePayloadBytes}`)
   assert.ok(resumeReq.userMessagePayload.text.includes(shortOut), "small parallel tool result must remain completely untruncated")
-  assert.ok(resumeReq.overflowUserText.includes("X".repeat(30_000)), "resume overflowUserText must preserve full p1")
-  assert.ok(resumeReq.overflowUserText.includes("Y".repeat(30_000)), "resume overflowUserText must preserve full p3")
-  assert.ok(resumeReq.overflowUserText.includes(shortOut), "resume overflowUserText must preserve p2")
+  // p1/p3 fit inline now that the budget matches the server's real ceiling, so assert
+  // reachability rather than a particular carriage: whichever way they travel, the full
+  // 30k payload must still be present somewhere the model can see it.
+  const resumeFrame = resumeReq.userMessagePayload.text
+  const resumeOverflow = resumeReq.overflowUserText || ""
+  const resumeReach = (t) => resumeFrame.includes(t) || resumeOverflow.includes(t)
+  assert.ok(resumeReach("L1_" + "X".repeat(30_000)), "resume: full p1 must survive in frame or overflow")
+  assert.ok(resumeReach("L2_" + "Y".repeat(30_000)), "resume: full p3 must survive in frame or overflow")
+  assert.ok(resumeReach(shortOut), "resume: small comment output must survive untruncated")
 })
 
-test("prompt_context.txt attachment note is added only after upload succeeds and final frame stays within 62 KB", async () => {
-  assert.equal(MAX_USER_MESSAGE_FRAME_BYTES, 62_000)
+test("prompt_context.txt attachment note is added only after upload succeeds and the payload stays within budget", async () => {
+  // The budget is the server's unit (payload JSON bytes). The wire frame is ~4/3 larger.
+  assert.equal(MAX_USER_MESSAGE_PAYLOAD_BYTES, 64_000)
+  assert.ok(MAX_USER_MESSAGE_FRAME_BYTES > MAX_USER_MESSAGE_PAYLOAD_BYTES)
   const acct = { providerType: "social", access: "tok-att", tenantUrl: "https://qbs-test.plato.ai.aws.dev", accountId: "att-acct" }
   const tools = [
     {
@@ -1640,7 +1649,8 @@ test("prompt_context.txt attachment note is added only after upload succeeds and
     attachmentId: "att-ok-1",
     contentSha256: "sha-ok",
   }))
-  assert.ok(okFrame.bytes <= MAX_USER_MESSAGE_FRAME_BYTES, `final frame with attachment + note must be <= ${MAX_USER_MESSAGE_FRAME_BYTES}, got ${okFrame.bytes}`)
+  const okPayload = payloadBytes(okFrame.payload)
+  assert.ok(okPayload <= MAX_USER_MESSAGE_PAYLOAD_BYTES, `final payload with attachment + note must be <= ${MAX_USER_MESSAGE_PAYLOAD_BYTES}, got ${okPayload}`)
   assert.match(okFrame.payload.attachments?.[0]?.name || "", /^tool_results_[a-z0-9]+\.txt$/i)
   assert.match(okFrame.payload.text, /attached in your Quick workspace at \/workspace\/attached_files\/tool_results_[a-z0-9]+\.txt/i)
   assert.match(okFrame.payload.text, /full content in attached file tool_results_[a-z0-9]+\.txt lines \d+-\d+/i)
@@ -1652,7 +1662,7 @@ test("prompt_context.txt attachment note is added only after upload succeeds and
   const failFrame = await runWithUploader(async () => {
     throw new Error("DLP upload failed")
   })
-  assert.ok(failFrame.bytes <= MAX_USER_MESSAGE_FRAME_BYTES)
+  assert.ok(payloadBytes(failFrame.payload) <= MAX_USER_MESSAGE_PAYLOAD_BYTES)
   assert.equal(failFrame.payload.attachments, undefined)
   assert.ok(!failFrame.payload.text.includes("attached_files/"), "must NOT mention attached file when upload fails")
   assert.match(failFrame.payload.text, /smaller line range/i)
@@ -1891,7 +1901,7 @@ test("resumed thread sends incremental <tools_update> when toolset changes acros
     },
   )
   const bulkBytes = buildAidpInputFrame({ type: "user_message", payload: compactResume.userMessagePayload }).byteLength
-  assert.ok(bulkBytes <= MAX_USER_MESSAGE_FRAME_BYTES, `compacted <tools_update> frame must be <= ${MAX_USER_MESSAGE_FRAME_BYTES}, got ${bulkBytes}`)
+  assert.ok(bulkBytes <= MAX_USER_MESSAGE_PAYLOAD_BYTES, `compacted <tools_update> payload must be <= ${MAX_USER_MESSAGE_PAYLOAD_BYTES}, got ${bulkBytes}`)
   assert.ok(compactResume.userMessagePayload.text.includes("<tools_update>"))
   assert.ok(compactResume.userMessagePayload.text.includes("mcp_bulk_0(query*: string"))
 })
@@ -2173,19 +2183,44 @@ test("line-boundary truncation, dropped-history marker + attachment, frame budge
   })
 
   // Frame budget hint present in tool protocol
-  assert.match(req.userMessagePayload.text, /~55 KB[\s\S]*~250 lines/)
+  assert.match(req.userMessagePayload.text, /about 64 KB[\s\S]*~250 lines/)
   // Stage 2 omitted marker present AND dropped earlier history spilled into overflowUserText on new thread
-  assert.match(req.userMessagePayload.text, /\[Earlier \d+ conversation message\(s\) omitted to fit 64KB frame\]/)
+  assert.match(req.userMessagePayload.text, /\[Earlier \d+ conversation message\(s\) omitted to fit the 64KB payload budget\]/)
   assert.ok(req.overflowUserText.includes("=== DROPPED EARLIER HISTORY"), "dropped history should be preserved in overflow attachment on new thread")
   assert.ok(req.overflowUserText.includes("Old Q1 "), "untruncated dropped history must be in overflow attachment")
-  assert.ok(req.overflowUserText.includes("=== TOOL RESULT #1"), "overflow attachment must have structured section headers")
+  // The protected tool result now fits inline under the server-sized budget, so it is
+  // carried verbatim in the frame and correctly does NOT get duplicated into the
+  // attachment. Structured section headers must still appear whenever a protected block
+  // does have to be spilled — pin that with a tight budget.
+  assert.ok(req.userMessagePayload.text.includes("line_1200"), "the protected tool result must ride inline in full")
+  assert.equal((req.userMessagePayload.text.match(/trimmed \d+ of/g) || []).length, 0, "nothing should be truncated when it fits")
+
+  const tightReq = openaiToSncsRequest(
+    {
+      model: "balanced",
+      tools: [readTool],
+      messages: [
+        { role: "user", content: "Old Q1 " + "H".repeat(25_000) },
+        { role: "assistant", content: "Old A1 " + "K".repeat(25_000) },
+        { role: "user", content: "Read file" },
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [{ id: "lb1", type: "function", function: { name: "read_file", arguments: '{"path":"big.mjs"}' } }],
+        },
+        { role: "tool", tool_call_id: "lb1", name: "read_file", content: codeLines },
+      ],
+    },
+    { maxPayloadBytes: 30_000 },
+  )
+  assert.ok(tightReq.overflowUserText.includes("=== TOOL RESULT #1"), "overflow attachment must have structured section headers")
 
   // Verify line-boundary snap: text immediately before `...[trimmed` ends with a newline, and text immediately after `]...` starts with a full line
-  const trimMatch = req.textWithAttachmentNote.match(/([^\n]*)\n\.\.\.\[trimmed \d+ of \d+ chars; full content in attached file (tool_results_[a-z0-9]+\.txt) lines (\d+)-(\d+)\]\.\.\.\n([^\n]*)/i)
+  const trimMatch = tightReq.textWithAttachmentNote.match(/([^\n]*)\n\.\.\.\[trimmed \d+ of \d+ chars; full content in attached file (tool_results_[a-z0-9]+\.txt) lines (\d+)-(\d+)\]\.\.\.\n([^\n]*)/i)
   assert.ok(trimMatch, "with-attachment text must include exact attachment filename and line range")
   assert.match(trimMatch[1], /^const line_\d{4} = `val_\$\{a\?\.b\?\.c_\d+\}`$/, "head cut must land cleanly on a full line boundary")
   assert.match(trimMatch[5], /^const line_\d{4} = `val_\$\{a\?\.b\?\.c_\d+\}`$/, "tail cut must land cleanly on a full line boundary")
-  const attachLines = req.overflowUserText.split("\n")
+  const attachLines = tightReq.overflowUserText.split("\n")
   const startLine = Number(trimMatch[3])
   const endLine = Number(trimMatch[4])
   assert.ok(attachLines[startLine - 1].startsWith('<tool_result id="lb1"'), `line ${startLine} should start tool_result`)
@@ -2832,8 +2867,8 @@ test("system instructions survive the overflow pipeline: anchor inline, full tex
   // Case A: a system prompt too large for the frame with a one-line user
   // message. Stage 4 never engages here, so only Stage 3's spill saves it.
   const small = openaiToSncsRequest({ model: "balanced", messages: [{ role: "system", content: SYS }, { role: "user", content: "短问" }] }, {})
-  const smallWire = buildAidpInputFrame({ type: "user_message", payload: small.userMessagePayload }).byteLength
-  assert.ok(smallWire <= MAX_USER_MESSAGE_FRAME_BYTES, `frame must stay within budget, got ${smallWire}`)
+  const smallPayload = payloadBytes(small.userMessagePayload)
+  assert.ok(smallPayload <= MAX_USER_MESSAGE_PAYLOAD_BYTES, `payload must stay within budget, got ${smallPayload}`)
   const smallText = small.userMessagePayload.text
   assert.ok(smallText.includes("<instructions>"), "the instruction block must never disappear")
   assert.ok(smallText.includes("SYSTEM-HEAD-MARKER"), "a head anchor must ride inline")
@@ -2848,8 +2883,8 @@ test("system instructions survive the overflow pipeline: anchor inline, full tex
   while (finalTurn.length < 27_000) finalTurn += "时间线条目内容含元思考链片段。"
   const big = openaiToSncsRequest({ model: "balanced", messages: [{ role: "system", content: SYS }, { role: "user", content: finalTurn }] }, {})
   const bigText = big.userMessagePayload.text
-  const bigWire = buildAidpInputFrame({ type: "user_message", payload: big.userMessagePayload }).byteLength
-  assert.ok(bigWire <= MAX_USER_MESSAGE_FRAME_BYTES, `frame must stay within budget, got ${bigWire}`)
+  const bigPayload = payloadBytes(big.userMessagePayload)
+  assert.ok(bigPayload <= MAX_USER_MESSAGE_PAYLOAD_BYTES, `payload must stay within budget, got ${bigPayload}`)
   assert.ok(bigText.includes("<instructions>"))
   assert.ok(bigText.includes("SYSTEM-HEAD-MARKER"))
   const deliveredSys = bigText.includes("PERSONA-KEY-RULE") || (big.sysAttachmentText || "").includes("PERSONA-KEY-RULE")
@@ -2866,8 +2901,8 @@ test("system attachment is generated whenever Stage 3 trims the system prompt, e
   assert.match(plan.sysAttachmentRange.name, /^system_instructions\.txt$/)
   assert.equal(plan.sysAttachmentRange.startLine, 1)
   assert.equal(plan.sysAttachmentRange.endLine, SYS.split("\n").length)
-  const wire = buildAidpInputFrame({ type: "user_message", payload: plan.userMessagePayload }).byteLength
-  assert.ok(wire <= MAX_USER_MESSAGE_FRAME_BYTES, `frame must stay within budget, got ${wire}`)
+  const wirePayload = payloadBytes(plan.userMessagePayload)
+  assert.ok(wirePayload <= MAX_USER_MESSAGE_PAYLOAD_BYTES, `payload must stay within budget, got ${wirePayload}`)
 
   // An untrimmed system prompt allocates no attachment at all.
   const plain = openaiToSncsRequest({ model: "balanced", messages: [{ role: "system", content: "SHORT SYS" }, { role: "user", content: "hi" }] }, {})
@@ -3021,9 +3056,25 @@ test("Stage 5 keeps the Stage 4 line references and droppedRange when it adds th
   assert.ok(plan.sysAttachmentText.includes("SYS-HEAD"))
   assert.ok(plan.textWithAttachmentNote, "the attachment variant of the frame must exist")
 
-  // prompt_context line refs: the dropped-history range and the per-message range
+  // The dropped-history range always rides along with the attachment note.
   assert.match(plan.textWithAttachmentNote, /Omitted earlier history is in lines \d+-\d+/)
-  assert.match(plan.textWithAttachmentNote, /attached file prompt_context_[a-z0-9]+\.txt lines \d+-\d+/i)
+  // Per-message line refs only appear on Stage 4's attachment variant. With the payload
+  // budget matching the server's real ceiling, this shape is satisfied by trimming the
+  // system prompt instead, so assert the ref on a shape that must go through Stage 4.
+  // Force the tight-budget path where a protected block really has to be truncated
+  // inline: only then does Stage 4 emit a per-message line reference.
+  const stage4Seed = [{ role: "system", content: SYS }]
+  for (let i = 0; i < 30; i++) {
+    stage4Seed.push({ role: "user", content: "问题 " + i + " " + "内容".repeat(200) })
+    stage4Seed.push({ role: "assistant", content: "回答 " + i + " " + "结果".repeat(200) })
+  }
+  stage4Seed.push({ role: "user", content: "尾部 " + "尾部内容".repeat(5000) })
+  const stage4Plan = openaiToSncsRequest({ model: "balanced", messages: stage4Seed }, { maxPayloadBytes: 46_500 })
+  assert.match(
+    stage4Plan.textWithAttachmentNote,
+    /attached file prompt_context_[a-z0-9]+\.txt lines \d+-\d+/i,
+    "Stage 4's attachment variant must still emit per-message line references",
+  )
   // system_instructions line ref, in BOTH frame variants
   assert.match(plan.textWithAttachmentNote, /system_instructions\.txt lines \d+-\d+/)
   assert.match(plan.userMessagePayload.text, /system_instructions\.txt lines \d+-\d+/)
@@ -3033,8 +3084,11 @@ test("Stage 5 keeps the Stage 4 line references and droppedRange when it adds th
     type: "user_message",
     payload: { ...plan.userMessagePayload, text: plan.textWithAttachmentNote },
   }).byteLength
-  assert.ok(wire <= MAX_USER_MESSAGE_FRAME_BYTES, `plain frame within budget, got ${wire}`)
-  assert.ok(wireNote <= MAX_USER_MESSAGE_FRAME_BYTES, `note frame within budget, got ${wireNote}`)
+  assert.ok(payloadBytes(plan.userMessagePayload) <= MAX_USER_MESSAGE_PAYLOAD_BYTES, `plain payload within budget, got ${payloadBytes(plan.userMessagePayload)}`)
+  assert.ok(
+    payloadBytes({ ...plan.userMessagePayload, text: plan.textWithAttachmentNote }) <= MAX_USER_MESSAGE_PAYLOAD_BYTES,
+    `note payload within budget, got ${payloadBytes({ ...plan.userMessagePayload, text: plan.textWithAttachmentNote })}`,
+  )
 })
 
 test("an uploaded system_instructions.txt always has an inline pointer, even near the frame limit", async () => {
@@ -3049,8 +3103,8 @@ test("an uploaded system_instructions.txt always has an inline pointer, even nea
       while (tail.length < tailLen) tail += "尾部内容"
       const plan = openaiToSncsRequest({ model: "balanced", messages: [{ role: "system", content: SYS }, { role: "user", content: tail }] }, {})
       const text = plan.userMessagePayload.text || ""
-      const wire = buildAidpInputFrame({ type: "user_message", payload: plan.userMessagePayload }).byteLength
-      assert.ok(wire <= MAX_USER_MESSAGE_FRAME_BYTES, `frame within budget at repeat=${repeat} tail=${tailLen}, got ${wire}`)
+      const wireP = payloadBytes(plan.userMessagePayload)
+      assert.ok(wireP <= MAX_USER_MESSAGE_PAYLOAD_BYTES, `payload within budget at repeat=${repeat} tail=${tailLen}, got ${wireP}`)
       if (!plan.sysAttachmentText) continue
       withAttachment++
       assert.match(
@@ -3060,11 +3114,8 @@ test("an uploaded system_instructions.txt always has an inline pointer, even nea
       )
       assert.ok(text.includes("SYS-HEAD"), "the anchor must survive too")
       if (plan.textWithAttachmentNote) {
-        const wireNote = buildAidpInputFrame({
-          type: "user_message",
-          payload: { ...plan.userMessagePayload, text: plan.textWithAttachmentNote },
-        }).byteLength
-        assert.ok(wireNote <= MAX_USER_MESSAGE_FRAME_BYTES, `note frame within budget, got ${wireNote}`)
+        const wireNoteP = payloadBytes({ ...plan.userMessagePayload, text: plan.textWithAttachmentNote })
+        assert.ok(wireNoteP <= MAX_USER_MESSAGE_PAYLOAD_BYTES, `note payload within budget, got ${wireNoteP}`)
       }
     }
   }
@@ -3079,6 +3130,14 @@ test("an uploaded system_instructions.txt always has an inline pointer, even nea
 // never engaged, and its else-if branch gave up because the announcement note
 // did not fit — so all 94 messages disappeared without a trace.
 // ---------------------------------------------------------------------------
+
+/**
+ * The budget the pipeline enforces is measured in payload JSON bytes — the same unit
+ * the server rejects on. Kept alongside `wireBytes` so tests can still assert the
+ * actual base64 frame stays sane.
+ */
+const payloadBytes = (payload) =>
+  Buffer.byteLength(JSON.stringify({ type: "user_message", payload }), "utf8")
 
 const wireBytes = (payload) =>
   buildAidpInputFrame({ type: "user_message", payload }).byteLength
@@ -3122,8 +3181,10 @@ test("dropped history always reaches the overflow attachment instead of vanishin
   const omitted = Number((frame.match(/\[Earlier (\d+) conversation message\(s\) omitted/) || [])[1] || 0)
   assert.ok(omitted > 0, "the scenario must actually drop history")
   assert.match(plan.overflowUserText, /=== DROPPED EARLIER HISTORY/, "dropped history must be spilled")
+  // The oldest message must be in the attachment. The newest history message only has
+  // to be reachable: it stays inline whenever the budget has room for it, and the
+  // reachability check below is what actually guarantees it is never lost.
   assert.ok(plan.overflowUserText.includes(tags[0]), "the oldest message must be in the attachment")
-  assert.ok(plan.overflowUserText.includes(tags[tags.length - 2]), "and so must the last history message")
 
   // Every marker is reachable somewhere: inline or in a file the turn uploads.
   const reachable = (m) => frame.includes(m) || plan.overflowUserText.includes(m)
@@ -3132,9 +3193,9 @@ test("dropped history always reaches the overflow attachment instead of vanishin
   // Both notes fit the real frame budget.
   assert.ok(plan.sysAttachmentText, "the full system text must still be published")
   assert.match(plan.textWithAttachmentNote, /system_instructions\.txt lines \d+-\d+/, "the system pointer must survive")
-  assert.ok(wireBytes(plan.userMessagePayload) <= MAX_USER_MESSAGE_FRAME_BYTES, "plain frame within budget")
+  assert.ok(payloadBytes(plan.userMessagePayload) <= MAX_USER_MESSAGE_PAYLOAD_BYTES, "plain frame within budget")
   assert.ok(
-    wireBytes({ ...plan.userMessagePayload, text: plan.textWithAttachmentNote }) <= MAX_USER_MESSAGE_FRAME_BYTES,
+    payloadBytes({ ...plan.userMessagePayload, text: plan.textWithAttachmentNote }) <= MAX_USER_MESSAGE_PAYLOAD_BYTES,
     "note frame within budget",
   )
 })
@@ -3187,7 +3248,7 @@ test("a resumed turn's dropped delta is spilled too, not only a fresh thread's",
   assert.match(frame, /\[Earlier \d+ conversation message\(s\) omitted/, "the delta must overflow")
   assert.match(plan.overflowUserText, /=== DROPPED EARLIER HISTORY/, "the dropped delta must be spilled")
   assert.ok(plan.overflowUserText.includes("RSU1"), "the first dropped delta message must be recoverable")
-  assert.ok(wireBytes(plan.userMessagePayload) <= MAX_USER_MESSAGE_FRAME_BYTES, "frame within budget")
+  assert.ok(payloadBytes(plan.userMessagePayload) <= MAX_USER_MESSAGE_PAYLOAD_BYTES, "frame within budget")
 })
 
 test("Stage 4's last-resort shift moves blocks into the attachment instead of dropping them", () => {
@@ -3214,7 +3275,7 @@ test("Stage 4's last-resort shift moves blocks into the attachment instead of dr
   }
   assert.match(plan.overflowUserText, /=== DROPPED EARLIER HISTORY/, "the shifted blocks need a section")
   assert.match(plan.textWithAttachmentNote, /Omitted earlier history is in lines \d+-\d+/, "with a line range")
-  assert.ok(wireBytes(plan.userMessagePayload) <= MAX_USER_MESSAGE_FRAME_BYTES, "frame within budget")
+  assert.ok(payloadBytes(plan.userMessagePayload) <= MAX_USER_MESSAGE_PAYLOAD_BYTES, "frame within budget")
 })
 
 
@@ -3240,12 +3301,12 @@ test("old history is spilled whole instead of being trimmed in place", () => {
   const lost = tags.filter((t) => !frame.includes(`MID${t}`) && !plan.overflowUserText.includes(`MID${t}`))
   assert.deepEqual(lost, [], "no message middle may disappear from both frame and attachment")
   assert.ok(plan.overflowUserText.length > 0, "the evicted history must actually be spilled")
-  assert.ok(wireBytes(plan.userMessagePayload) <= MAX_USER_MESSAGE_FRAME_BYTES, "frame within budget")
+  assert.ok(payloadBytes(plan.userMessagePayload) <= MAX_USER_MESSAGE_PAYLOAD_BYTES, "frame within budget")
 })
 
 test("the overflow attachment is not bounded by the frame budget", () => {
-  // The file carries the complete text no matter how large; only the frame is
-  // capped at MAX_USER_MESSAGE_FRAME_BYTES. A multi-megabyte turn must still be
+  // The file carries the complete text no matter how large; only the payload is
+  // capped at MAX_USER_MESSAGE_PAYLOAD_BYTES. A multi-megabyte turn must still be
   // recoverable in full from the attachment.
   for (const size of [200_000, 3_000_000]) {
     const plan = openaiToSncsRequest({
@@ -3254,7 +3315,7 @@ test("the overflow attachment is not bounded by the frame budget", () => {
     })
     assert.ok(plan.overflowUserText.length >= size, `the attachment must hold the whole turn (size=${size})`)
     assert.ok(plan.overflowUserText.includes("TAILMARK"), `the end of the turn must survive (size=${size})`)
-    assert.ok(wireBytes(plan.userMessagePayload) <= MAX_USER_MESSAGE_FRAME_BYTES, `frame stays capped (size=${size})`)
+    assert.ok(payloadBytes(plan.userMessagePayload) <= MAX_USER_MESSAGE_PAYLOAD_BYTES, `frame stays capped (size=${size})`)
   }
 })
 
@@ -3365,7 +3426,7 @@ test("the Stage 5 system pointer is announced next to a spilled history, never i
   assert.match(noteVariant, /Omitted earlier history is in lines \d+-\d+/, "history line range must survive")
   assert.match(noteVariant, /system_instructions\.txt lines \d+-\d+/, "the system pointer must be present too")
   assert.ok(
-    wireBytes({ ...plan.userMessagePayload, text: noteVariant }) <= MAX_USER_MESSAGE_FRAME_BYTES,
+    payloadBytes({ ...plan.userMessagePayload, text: noteVariant }) <= MAX_USER_MESSAGE_PAYLOAD_BYTES,
     "the combined note must still fit the frame",
   )
 })
@@ -3397,12 +3458,12 @@ test("a swept matrix of long conversations never loses a message and never overs
           `sys=${sysChars} pairs=${pairs} msg=${msgChars}: unreachable messages`,
         )
         assert.ok(
-          wireBytes(plan.userMessagePayload) <= MAX_USER_MESSAGE_FRAME_BYTES,
+          payloadBytes(plan.userMessagePayload) <= MAX_USER_MESSAGE_PAYLOAD_BYTES,
           `sys=${sysChars} pairs=${pairs} msg=${msgChars}: plain frame over budget`,
         )
         if (plan.textWithAttachmentNote) {
           assert.ok(
-            wireBytes({ ...plan.userMessagePayload, text: plan.textWithAttachmentNote }) <= MAX_USER_MESSAGE_FRAME_BYTES,
+            payloadBytes({ ...plan.userMessagePayload, text: plan.textWithAttachmentNote }) <= MAX_USER_MESSAGE_PAYLOAD_BYTES,
             `sys=${sysChars} pairs=${pairs} msg=${msgChars}: note frame over budget`,
           )
         }
