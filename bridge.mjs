@@ -1,5 +1,18 @@
 import { createHash, randomUUID } from "node:crypto"
 import {
+  closeSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+  writeSync,
+} from "node:fs"
+import { homedir } from "node:os"
+import { join } from "node:path"
+import {
   buildAidpInputFrame,
   buildGatewayInputFrame,
   decodeAidpFrame,
@@ -10,6 +23,7 @@ import {
   APP_VERSION,
   hostFromUrl,
   isGatewayProvider,
+  quickworkDir,
   surfaceTypeForPlatform,
   uploadQuickAttachment,
 } from "./credentials.mjs"
@@ -755,6 +769,8 @@ function formatTrailingToolDirective(tools, toolChoice, hasToolResults = false) 
 
 const THREAD_CACHE_MAX = 200
 const THREAD_CACHE_TTL_MS = 2 * 3600_000
+// A persisted binding outlives the in-memory cache: the point is to survive restarts.
+const THREAD_STATE_TTL_MS = 14 * 24 * 3600_000
 
 function sha256Hex(str) {
   return createHash("sha256").update(String(str ?? ""), "utf8").digest("hex")
@@ -887,10 +903,141 @@ function formatConvoBlocks(msgs) {
   return blocks.length ? blocks : [{ text: "Hello", msgIndex: 0, role: "user" }]
 }
 
+
+// ---------------------------------------------------------------------------
+// Durable thread binding
+// ---------------------------------------------------------------------------
+//
+// Quick keeps a conversation's history server-side and keys it entirely on the
+// `thread_id` carried by each user_message. Whoever supplies that id owns the
+// conversation: the server replays nothing and stores nothing client-side, so a
+// stable id means every turn only has to carry the new message instead of
+// re-sending the whole history into a ~64 KB payload.
+//
+// The in-memory cache above can only rediscover a thread by hashing message
+// prefixes, which stops working the moment the process restarts, the TTL lapses,
+// or the caller rewrites the head of its history. Persisting the binding makes
+// continuity survive all three.
+//
+// Two processes (or two plugin instances) may share one state file, so every
+// read-modify-write is done under an exclusive lock file. Writing a turn into a
+// thread that another turn is concurrently writing is not merely racy: measured
+// against the live service, two simultaneous user_messages on one thread_id both
+// come back with the *same* answer and one of the two messages is lost (3/3
+// reproducible). The lock is therefore correctness, not politeness.
+
+const THREAD_STATE_FILE = "thread-bindings.json"
+const THREAD_STATE_MAX = 500
+const THREAD_LOCK_TIMEOUT_MS = 8_000
+const THREAD_LOCK_STALE_MS = 30_000
+
+/** Where the durable thread bindings live. Override with MAGPIE_QUICK_STATE_DIR. */
+export function threadStatePath(env = process.env) {
+  const override = String(env.MAGPIE_QUICK_STATE_DIR || "").trim()
+  const dir = override || quickworkDir(env, homedir())
+  return join(dir, THREAD_STATE_FILE)
+}
+
+function readThreadState(file) {
+  try {
+    const parsed = JSON.parse(readFileSync(file, "utf8"))
+    if (parsed && typeof parsed === "object" && parsed.bindings && typeof parsed.bindings === "object") {
+      return parsed
+    }
+  } catch {}
+  return { version: 1, bindings: {} }
+}
+
+/** Atomic replace: a torn write would otherwise lose every binding at once. */
+function writeThreadState(file, state) {
+  const tmp = `${file}.${process.pid}.${Date.now()}.tmp`
+  writeFileSync(tmp, JSON.stringify(state), { encoding: "utf8", mode: 0o600 })
+  renameSync(tmp, file)
+}
+
+function sleepMs(ms) {
+  // Synchronous on purpose: the lock has to hold across a read-modify-write that
+  // must not yield to another async turn in the same process.
+  const end = Date.now() + ms
+  while (Date.now() < end) {
+    try {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.min(25, ms))
+    } catch {
+      // Atomics.wait can be unavailable; fall back to a busy pause.
+    }
+  }
+}
+
+/**
+ * Run `fn` while holding the cross-process lock. `fn` receives the parsed state and
+ * returns `{ state?, result? }`; `state` is written back atomically.
+ */
+function withThreadStateLock(file, fn, opts = {}) {
+  const timeoutMs = Number(opts.lockTimeoutMs) > 0 ? Number(opts.lockTimeoutMs) : THREAD_LOCK_TIMEOUT_MS
+  mkdirSync(join(file, ".."), { recursive: true })
+  const lockPath = `${file}.lock`
+  const deadline = Date.now() + timeoutMs
+  let fd = -1
+  for (;;) {
+    try {
+      fd = openSync(lockPath, "wx", 0o600)
+      break
+    } catch (err) {
+      if (err?.code !== "EEXIST") throw err
+      // Break a lock left behind by a process that died mid-write.
+      try {
+        if (Date.now() - statSync(lockPath).mtimeMs > THREAD_LOCK_STALE_MS) {
+          unlinkSync(lockPath)
+          continue
+        }
+      } catch {}
+      if (Date.now() >= deadline) {
+        // Give up rather than corrupt: the in-memory cache still works this turn.
+        throw new Error("thread state lock timeout")
+      }
+      sleepMs(15)
+    }
+  }
+  try {
+    try {
+      writeSync(fd, `${process.pid}\n`)
+    } catch {}
+    const state = readThreadState(file)
+    const out = fn(state) || {}
+    if (out.state) writeThreadState(file, out.state)
+    return { result: out.result, held: true }
+  } finally {
+    try {
+      closeSync(fd)
+    } catch {}
+    try {
+      unlinkSync(lockPath)
+    } catch {}
+  }
+}
+
+function stateKey(accountKey, sessionId) {
+  return `${accountKey}::${sessionId}`
+}
+
+/** Best-effort: a state-file problem must never fail a turn. */
+function safeWithThreadLock(file, fn, opts) {
+  try {
+    return withThreadStateLock(file, fn, opts)
+  } catch {
+    return { result: undefined, held: false }
+  }
+}
+
 /**
  * In-memory bounded thread cache mapping conversation prefixes & session IDs to Amazon Quick `threadId`s.
  */
-export function createThreadStore(maxEntries = THREAD_CACHE_MAX, ttlMs = THREAD_CACHE_TTL_MS) {
+export function createThreadStore(maxEntries = THREAD_CACHE_MAX, ttlMs = THREAD_CACHE_TTL_MS, opts = {}) {
+  // Persistence is opt-in: an explicit path, or MY own instance of the default one.
+  // Never share the default file between stores, or a doubled cache would fight
+  // itself over one binding.
+  const statePath = opts.statePath === undefined ? null : opts.statePath
+  const stateTtlMs = Number(opts.stateTtlMs) > 0 ? Number(opts.stateTtlMs) : THREAD_STATE_TTL_MS
   // Thread-level LRU (`threads`: threadId -> record) with O(1) secondary index Maps so a single
   // thread with many parallel tool_call_ids still counts as 1 LRU entry instead of evicting others.
   const threads = new Map()
@@ -922,6 +1069,42 @@ export function createThreadStore(maxEntries = THREAD_CACHE_MAX, ttlMs = THREAD_
     if (!record) return
     threads.delete(threadId)
     removeIndexes(record)
+  }
+
+  /**
+   * Pull a binding back off disk and re-seed the in-memory cache so the rest of
+   * lookup() (prefix verification, delta computation) works unchanged.
+   * Returns null when there is no usable binding.
+   */
+  const restorePersistedThread = (accountKey, sessionId) => {
+    if (!statePath || !sessionId) return null
+    const key = stateKey(accountKey, sessionId)
+    const hit = safeWithThreadLock(statePath, (state) => ({ result: state.bindings[key] || null })).result
+    if (!hit || !hit.threadId) return null
+    if (Number(hit.updatedAt) && Date.now() - Number(hit.updatedAt) > stateTtlMs) return null
+    const record = {
+      threadId: hit.threadId,
+      workingSessionId: hit.workingSessionId || "",
+      accountKey,
+      hasTools: Boolean(hit.hasTools),
+      lang: hit.lang || "",
+      toolsSig: hit.toolsSig || "",
+      toolMap: hit.toolMap || null,
+      sysText: hit.sysText || "",
+      msgHashes: Array.isArray(hit.msgHashes) ? hit.msgHashes : [],
+      expectedAssistantSig: hit.expectedAssistantSig || "",
+      expectedAssistantCallsSig: hit.expectedAssistantCallsSig || "",
+      expectedAssistantTextSig: hit.expectedAssistantTextSig || "",
+      toolCallIds: Array.isArray(hit.toolCallIds) ? hit.toolCallIds : [],
+      updatedAt: Number(hit.updatedAt) || Date.now(),
+      restored: true,
+    }
+    if (!record.msgHashes.length) return null
+    threads.delete(record.threadId)
+    threads.set(record.threadId, record)
+    bySession.set(`${accountKey}|${sessionId}`, record.threadId)
+    prune(Date.now())
+    return record
   }
 
   const prune = (now) => {
@@ -1056,6 +1239,13 @@ export function createThreadStore(maxEntries = THREAD_CACHE_MAX, ttlMs = THREAD_
       if (sessionId) {
         const sk = `${accountKey}|${sessionId}`
         candidates.push([`sess:${sk}`, bySession.get(sk)])
+        // A restart (or an expired TTL) empties the maps above. The durable binding
+        // still knows which server thread this caller session owns, which is the
+        // whole reason it is on disk.
+        if (!bySession.has(sk) && statePath) {
+          const restored = restorePersistedThread(accountKey, sessionId)
+          if (restored) candidates.push([`sess:${sk}`, restored.threadId])
+        }
       }
       const hk = `${accountKey}|${toolsSig}|${hashes[0]}`
       candidates.push([`head:${hk}`, byHead.get(hk)])
@@ -1137,11 +1327,62 @@ export function createThreadStore(maxEntries = THREAD_CACHE_MAX, ttlMs = THREAD_
       for (const tk of tcKeys) byToolCall.set(tk, tid)
       prune(now)
     },
+    /**
+     * Write the binding to disk so a later process can resume this thread.
+     * Called from the turn commit, under its own lock.
+     */
+    persist(state) {
+      if (!statePath || !state?.threadId || !state?.sessionId) return false
+      const key = stateKey(state.accountKey, state.sessionId)
+      const now = Date.now()
+      const record = {
+        threadId: state.threadId,
+        workingSessionId: state.workingSessionId || "",
+        hasTools: Boolean(state.hasTools),
+        lang: state.lang || "",
+        toolsSig: state.toolsSig || "",
+        toolMap: state.toolMap || null,
+        sysText: state.sysText || "",
+        msgHashes: Array.isArray(state.msgHashes) ? state.msgHashes : [],
+        expectedAssistantSig: state.expectedAssistantSig || "",
+        expectedAssistantCallsSig: state.expectedAssistantCallsSig || "",
+        expectedAssistantTextSig: state.expectedAssistantTextSig || "",
+        toolCallIds: Array.isArray(state.toolCallIds) ? state.toolCallIds : [],
+        updatedAt: now,
+      }
+      const out = safeWithThreadLock(statePath, (persisted) => {
+        persisted.version = persisted.version || 1
+        persisted.bindings = persisted.bindings || {}
+        persisted.bindings[key] = record
+        // Bound the file the same way the LRU bounds memory.
+        const entries = Object.entries(persisted.bindings)
+        if (entries.length > THREAD_STATE_MAX) {
+          entries.sort((a, b) => (Number(b[1]?.updatedAt) || 0) - (Number(a[1]?.updatedAt) || 0))
+          persisted.bindings = Object.fromEntries(entries.slice(0, THREAD_STATE_MAX))
+        }
+        return { state: persisted }
+      })
+      return out.held
+    },
+    forgetPersisted(accountKey, sessionId) {
+      if (!statePath || !sessionId) return false
+      const key = stateKey(accountKey, sessionId)
+      const out = safeWithThreadLock(statePath, (persisted) => {
+        if (persisted.bindings && persisted.bindings[key]) {
+          delete persisted.bindings[key]
+          return { state: persisted }
+        }
+        return {}
+      })
+      return out.held
+    },
     invalidate(accountKey, sessionId, threadId) {
       if (threadId) {
         const rec = threads.get(threadId)
         if (rec && rec.accountKey === accountKey) deleteThread(threadId)
       }
+      // A dead thread must not be restored from disk on the next turn.
+      this.forgetPersisted(accountKey, sessionId)
       if (sessionId) {
         const sk = `${accountKey}|${sessionId}`
         const tid = bySession.get(sk)
@@ -1163,7 +1404,9 @@ export function createThreadStore(maxEntries = THREAD_CACHE_MAX, ttlMs = THREAD_
   }
 }
 
-export const DEFAULT_THREAD_STORE = createThreadStore()
+export const DEFAULT_THREAD_STORE = createThreadStore(THREAD_CACHE_MAX, THREAD_CACHE_TTL_MS, {
+  statePath: threadStatePath(),
+})
 
 /**
  * Convert an OpenAI `/chat/completions` JSON request body into SNCS `user_message` fields,
@@ -2594,7 +2837,7 @@ async function runSncsTurn(a, openaiBody, ctx) {
         ? sha256Hex(textFromContent(assistantContent).trim())
         : ""
       const toolCallIds = splitter.calls.map((c) => c?.id).filter(Boolean)
-      threadStore.commit(accountKey, opts.sessionId || "", {
+      const commitState = {
         threadId: reqPlan.threadId,
         workingSessionId: reqPlan.workingSessionId,
         hasTools: Boolean(reqPlan.hasTools),
@@ -2612,7 +2855,11 @@ async function runSncsTurn(a, openaiBody, ctx) {
         expectedAssistantCallsSig,
         expectedAssistantTextSig,
         toolCallIds,
-      })
+      }
+      threadStore.commit(accountKey, opts.sessionId || "", commitState)
+      // Only a successful turn earns a durable binding: persisting on failure would
+      // pin later turns to a thread the server never really advanced.
+      threadStore.persist?.({ ...commitState, accountKey, sessionId: opts.sessionId || "" })
     }
 
     const completeSuccess = () => {
