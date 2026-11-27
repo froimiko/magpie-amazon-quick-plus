@@ -14,6 +14,8 @@ import {
 } from "./credentials.mjs"
 import { configModels, DEFAULT_API_URL, executeSncsChat, modelsFromSettings } from "./bridge.mjs"
 import { agentMode } from "./agents.mjs"
+import { nativeDeviceToolsEnabled } from "./device-tools.mjs"
+import { createLocalDeviceToolExecutor } from "./device-exec.mjs"
 
 export const PROVIDER_ID = "amazon-quick-plus"
 export const PROVIDER_NAME = "Amazon Quick Plus"
@@ -113,7 +115,22 @@ export function createAmazonQuickPlugin(deps = {}) {
   // reported as losing the caller's context. MAGPIE_QUICK_AGENT_MODE=carrier
   // (or a deps.agentMode override) turns it on; off keeps the inline
   // <instructions> path.
-  const turnDeps = { ...deps, agentMode: agentMode({ ...deps, defaultMode: "off" }) }
+  // Native device tools are opt-in: they change what the model is offered on
+  // every turn and let it act on this machine, so they never turn themselves on.
+  // MAGPIE_QUICK_DEVICE_TOOLS=1 (or deps.nativeDeviceTools) enables them; the
+  // caller may also supply its own executor through deps.onDeviceToolCall.
+  const deviceToolsWanted = nativeDeviceToolsEnabled({ ...deps, nativeDeviceTools: deps.nativeDeviceTools ?? process.env.MAGPIE_QUICK_DEVICE_TOOLS })
+  const runDeviceToolCall =
+    typeof deps.onDeviceToolCall === "function"
+      ? deps.onDeviceToolCall
+      : deviceToolsWanted
+        ? createLocalDeviceToolExecutor({ roots: deps.deviceRoots, cwd: deps.cwd, allowShell: deps.allowShell !== false })
+        : undefined
+  const turnDeps = {
+    ...deps,
+    agentMode: agentMode({ ...deps, defaultMode: "off" }),
+    ...(runDeviceToolCall ? { nativeDeviceTools: true, onDeviceToolCall: runDeviceToolCall } : {}),
+  }
 
   return async function AmazonQuickAuthPlugin(ctx = {}) {
     const client = ctx?.client

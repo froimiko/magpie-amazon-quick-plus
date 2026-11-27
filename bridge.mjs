@@ -28,6 +28,65 @@ import {
   uploadQuickAttachment,
 } from "./credentials.mjs"
 import { agentModeEnabled, DEFAULT_AGENT_STORE, ensureCarrierAgent } from "./agents.mjs"
+import {
+  buildPutOutpostEnvelope,
+  buildToolResultEvent,
+  capToolResult,
+  defaultCapabilities,
+  nativeDeviceToolsEnabled,
+  stableDeviceId,
+  unwrapToolArguments,
+  toolCallSessionId,
+} from "./device-tools.mjs"
+
+// --- device registration -----------------------------------------------------
+
+/**
+ * Register this machine's tool manifest with the cell.
+ *
+ * MEASURED, AND NARROWER THAN IT LOOKS: this creates the outpost record and
+ * returns its ARN, but the record is stored with `status: "OFFLINE"` and stays
+ * OFFLINE. A device only becomes usable for turns once it holds a live
+ * connection to the cell — which is what the official desktop app's outpost
+ * process provides. With the official outpost running, the same turn gets device
+ * tool calls; with only this registration and no live connection, it gets none
+ * (A/B verified against one account in one process).
+ *
+ * So this call is necessary bookkeeping (it publishes what tools this client can
+ * run, and under which id), not an admission ticket. Do not drop the live
+ * connection requirement from the design on the strength of this function.
+ *
+ * Best-effort by design: a failed registration must not fail the turn. The turn
+ * simply goes out without device tools, exactly as before.
+ */
+async function registerDevice(a, opts = {}) {
+  const outpostId = String(opts.outpostId || "").trim()
+  if (!outpostId) return { ok: false, reason: "no_outpost_id" }
+  const tenantUrl = String(a?.tenantUrl || "").replace(/\/+$/, "")
+  if (!tenantUrl) return { ok: false, reason: "no_tenant_url" }
+  const fetchImpl = opts.fetch || globalThis.fetch
+  if (typeof fetchImpl !== "function") return { ok: false, reason: "no_fetch" }
+
+  const capabilities = opts.capabilities || defaultCapabilities()
+  const envelope = buildPutOutpostEnvelope({
+    outpostId,
+    name: opts.outpostName || "magpie-device",
+    capabilities,
+  })
+  try {
+    const res = await fetchImpl(tenantUrl + "/integration/quick-work/qbs-event", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer " + String(a?.access || "") },
+      body: JSON.stringify(envelope),
+      signal: opts.signal,
+    })
+    // Drain the body so the socket is reusable even though we ignore the payload.
+    try { await res.text() } catch {}
+    return { ok: res.ok, status: res.status }
+  } catch (e) {
+    return { ok: false, reason: String(e?.message || e) }
+  }
+}
 
 export const DEFAULT_API_URL = "https://quick.aws.com/v1"
 export const DEFAULT_CONTEXT_LIMIT = 1_000_000
@@ -1545,6 +1604,8 @@ export function openaiToSncsRequest(body, opts = {}) {
     traceId: randomUUID(),
     text: textVal,
     surfaceType,
+    // The device id must ride IN THE PAYLOAD, not only on the WS query string:
+    // measured, device tools are offered only when the payload carries it.
     ...(opts.outpostId ? { outpostId: opts.outpostId } : {}),
     appVersion: APP_VERSION,
     message_id: messageId,
@@ -2650,6 +2711,28 @@ async function runSncsTurn(a, openaiBody, ctx) {
   const wsHost = a.wsHost || hostFromUrl(a.tenantUrl)
   if (!wsHost) throw new Error("Missing Amazon Quick wsHost / tenantUrl")
 
+  // Native device tools, when the host asked for them:
+  //   1. pin ONE stable device id for this account+machine (an id per turn would
+  //      show up as a new offline device every time),
+  //   2. put it in both the turn payload and session_connect — the payload copy is
+  //      what makes the server offer device tools (measured),
+  //   3. publish this client's tool manifest under that id.
+  // Steps 1-3 are necessary but NOT sufficient: the account also needs room for
+  // the device row. A polluted account (hundreds of leftover outposts) accepts
+  // putOutpost and still routes zero device tool calls; that was the real cause
+  // of a whole round of confusing measurements. Because step 1 pins a STABLE id
+  // this is an upsert, so the plugin never adds rows and cannot pollute it.
+  // Any failure here degrades to the previous behaviour instead of failing the turn.
+  let deviceToolId = ""
+  if (nativeDeviceToolsEnabled(opts) && typeof opts.onDeviceToolCall === "function") {
+    deviceToolId = String(opts.outpostId || "").trim() ||
+      stableDeviceId(accountKeyOf(a) + "|" + (opts.outpostName || "") + "|" + (opts.platform || ""))
+    reqPlan.outpostId = deviceToolId
+    reqPlan.sessionConnectPayload.outpostId = deviceToolId
+    reqPlan.userMessagePayload.outpostId = deviceToolId
+    await registerDevice(a, { ...opts, outpostId: deviceToolId })
+  }
+
   const attachments = await prepareTurnAttachments(a, reqPlan, opts)
   if (attachments.length) {
     reqPlan.userMessagePayload.attachments = attachments
@@ -3030,6 +3113,48 @@ async function runSncsTurn(a, openaiBody, ctx) {
         handshakeReady = true
         if (reqPlan.stream && !settledInitial) openSseStream()
       }
+      if (type === "tool_call") {
+        // A DEVICE tool call: the server expects this machine to run it.
+        // Answering with a tool_result on the same socket is the whole contract;
+        // never let a missing handler turn into silence, or the turn hangs until
+        // the server times it out.
+        handshakeReady = true
+        const payload = ev.payload ?? ev
+        const toolCallId = String(payload.tool_call_id || "")
+        const toolName = String(payload.tool_name || "")
+        const rawArgs = payload.arguments ?? {}
+        const handler = opts.onDeviceToolCall
+        if (typeof handler !== "function") {
+          // No host handler: answer with an honest error so the model can adapt
+          // instead of waiting on a result that will never arrive.
+          try {
+            wsSend(buildToolResultEvent(toolCallId, null, "No device tool handler is registered on this client."))
+          } catch {}
+          return
+        }
+        const sessionId = toolCallSessionId(rawArgs)
+        Promise.resolve()
+          .then(() =>
+            handler({
+              toolCallId,
+              toolName,
+              arguments: unwrapToolArguments(rawArgs),
+              rawArguments: rawArgs,
+              sessionId,
+              threadId: reqPlan.threadId,
+            }),
+          )
+          .then((out) => {
+            const { result, error } = capToolResult(out?.result ?? out ?? null, out?.error ?? null)
+            if (!finished) wsSend(buildToolResultEvent(toolCallId, result, error))
+          })
+          .catch((e) => {
+            if (finished) return
+            const { result, error } = capToolResult(null, String(e?.message || e))
+            try { wsSend(buildToolResultEvent(toolCallId, result, error)) } catch {}
+          })
+        return
+      }
       if (
         type === "tool_start" ||
         type === "tool_arguments" ||
@@ -3096,6 +3221,17 @@ async function runSncsTurn(a, openaiBody, ctx) {
       }
       if (type === "message_complete" || type === "stream_ended") {
         completeSuccess()
+      }
+    }
+
+    const wsSend = (obj) => {
+      if (!ws || typeof ws.send !== "function") return false
+      if (ws.readyState !== undefined && ws.readyState !== 1) return false
+      try {
+        ws.send(encodeOutbound(obj))
+        return true
+      } catch {
+        return false
       }
     }
 

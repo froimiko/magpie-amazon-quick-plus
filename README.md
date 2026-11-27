@@ -33,6 +33,12 @@
   - 按账号复用**同一个**中性 carrier agent：`agentId` 持久化到本地 JSON（默认 `~/.quickwork/carrier-agents.json`），**插件重启后继续复用**，且成功缓存**不会按时间过期**，只有真正失效时才重建；首轮并发用 in-flight 去重。每条消息都新建草稿会逐步耗尽 `max_custom_agents` 配额，这是刻意避免的。载体指令只描述「遵循对话中的 `<instructions>`」，不含任何越狱 / 对抗词。
   - 只有明确指向草稿 agent 失效的错误（如 `agent not found` / 未知或无效的 agent id）才会让插件 `forget` 掉这个 id（内存 + 磁盘）并以 `chat_agent_id: null` 自动重试一次。WebSocket 瞬断、空闲超时、普通上游 5xx 并不说明草稿已失效，此时只重开线程重试、**保留存活的 agent id**，不会把整条会话降级回内联 `<instructions>` 路径。鉴权失败（401/403）与主动取消同样不触发降级。
   - 创建或写入失败（含 gateway 不支持、配额已满、网络异常）会在 10 分钟内记负缓存并**平滑降级**回 `chat_agent_id: null` + 内联 `<instructions>`，绝不阻断对话。开关见 `MAGPIE_QUICK_AGENT_MODE`。
+- **原生设备工具（本机执行，v0.5.0 新增）**：让模型真正在**本机**读写文件、跑命令，而不是在 Quick 的云端沙箱里空转。
+  - 走官方同款的 `putOutpost` 设备注册 + `tool_call` 帧协议，本机执行后经 `tool_result` 回传；`tool_start` / `tool_result`（云端沙盒）与 `tool_call`（设备）是两套完全不同的帧，插件只认后者。
+  - 默认**关闭**，`MAGPIE_QUICK_DEVICE_TOOLS=1` 或 `deps.nativeDeviceTools: true` 开启；也可用 `deps.onDeviceToolCall` 换成自己的执行器。
+  - 内置执行器覆盖 `folder_list` / `file_read` / `file_write` / `file_edit` / `file_move` / `file_copy` / `folder_create` / `file_delete` / `file_type` / `file_matches` / `ripgrep` / `terminal_on_device` / `run_python_on_device`，所有路径强制限制在允许根目录内。
+  - 设备 id 由 `stableDeviceId()` 依据「账号 + 机器」稳定派生，因此 `putOutpost` 是 upsert 而非新增。**这条很关键**：账号下堆积几百条僵尸设备记录会让服务端不再为任何新设备路由设备工具（本项目曾因此误判整轮）。
+  - **不需要**官方 Quick 桌面端或 `quickwork-agent` 进程在线。
 - **动态模型列表与用量查询**：通过 `api/ws-rpc`（`get_settings`）获取账号已启用的模型槽位，并通过 `profile/usage` 查询月度与会话配额窗口及重置时间。
 - **CJK 思维链与工具实参语言对齐**：中文 / 日文 / 韩文工具会话自动在 `custom_prompt` 注入语言一致性约束，避免将日志、报错文案或检索词翻译成英文导致查找失败；亦可通过环境变量隐藏上游 `reasoning_content`。
 
@@ -93,11 +99,12 @@ https://github.com/yubanmeiqin9048/magpie-amazon-quick-plus
 - `MAGPIE_QUICK_AGENT_MODE`：Draft Agent 通道开关（默认 `off`，回到仅内联 `<instructions>` 的方案）。设为 `carrier` 时启用草稿 agent 指令层。
 - `MAGPIE_QUICK_AGENT_CACHE_FILE`：Carrier 草稿 agent 缓存文件路径（默认 `<quickworkDir>/carrier-agents.json`，即通常是 `~/.quickwork/carrier-agents.json`；亦受 `QUICKWORK_DIR` / `AWS_QUICK_DIR` 影响）。只记录创建成功的 `agentId`，失败不落盘；读写异常自动退回纯内存。
 - `MAGPIE_QUICK_WEB_SEARCH`：未显式传 `web_search_enabled` 时的默认值（默认开启，与桌面端一致）。设为 `false` / `0` / `off` / `no` 时默认关闭云端联网，避免抢答调用方自己的工具链；请求体显式传参始终优先。
+- `MAGPIE_QUICK_DEVICE_TOOLS`：原生设备工具开关（默认 `off`）。设为 `1` / `true` / `yes` / `on` 时启用，模型下发的 `tool_call` 会由插件在本机执行；等价于 `deps.nativeDeviceTools: true`，也可用 `deps.onDeviceToolCall` 换成自己的执行器。
 
 ## 测试
 
 ```bash
-node --test index.test.mjs
+node --test index.test.mjs device-tools.test.mjs
 ```
 
 ## 开源协议
@@ -134,6 +141,12 @@ Works with **OpenCode 1.x**, **OpenCode 2.x**, and **Magpie** with zero external
   - One **shared** neutral carrier agent per account keeps every conversation off the `max_custom_agents` quota. Its id is persisted to a small local JSON file (default `~/.quickwork/carrier-agents.json`), so a plugin restart keeps reusing it, and a successful id **never expires on a timer** — it is rebuilt only when it actually fails. Concurrent first turns are de-duplicated by an in-flight promise. The carrier instructions only restate "follow the caller's `<instructions>`" and contain no jailbreak or override phrasing.
   - Only an error that names the draft agent (for example `agent not found`, or an unknown/invalid agent id) proves the cached id is dead; the plugin then `forget`s it (memory and disk) and retries once with `chat_agent_id: null`. A dropped websocket, an idle timeout or a generic upstream 5xx says nothing about the draft, so the turn merely restarts on a fresh thread and **keeps the live agent id** rather than demoting the whole session to the inline `<instructions>` path. Auth failures (401/403) and deliberate aborts do not trigger the downgrade either.
   - Any failure (unsupported gateway surface, quota exhaustion, network error, missing `agent_id`) is negatively cached for 10 minutes and **degrades smoothly** back to `chat_agent_id: null` plus inline `<instructions>`; a turn is never blocked. Toggle with `MAGPIE_QUICK_AGENT_MODE`.
+- **Native Device Tools (local execution, new in v0.5.0)**: the model reads and writes files and runs commands on **your** machine instead of spinning inside Quick's cloud sandbox.
+  - Uses the same `putOutpost` registration and `tool_call` frame protocol as the official client, running each tool locally and answering over `tool_result`. `tool_start` / `tool_result` (cloud sandbox) and `tool_call` (device) are two unrelated frame families; only the latter counts.
+  - **Off by default**; enable with `MAGPIE_QUICK_DEVICE_TOOLS=1` or `deps.nativeDeviceTools: true`, or supply `deps.onDeviceToolCall` to plug in your own executor.
+  - The built-in executor covers `folder_list` / `file_read` / `file_write` / `file_edit` / `file_move` / `file_copy` / `folder_create` / `file_delete` / `file_type` / `file_matches` / `ripgrep` / `terminal_on_device` / `run_python_on_device`, with every path confined to the allowed roots.
+  - The device id comes from `stableDeviceId()`, derived from account + machine, so `putOutpost` is an upsert rather than an insert. **This matters**: once an account accumulates hundreds of leftover device rows, the service stops routing device tools to any new device (this project lost a whole investigation to that).
+  - Does **not** require the official Quick desktop app or a running `quickwork-agent`.
 - **Dynamic Models & Usage**: Discovers active model slots from `api/ws-rpc` (`get_settings`) and reports monthly & session quota windows from `profile/usage`.
 - **CJK Reasoning & Tool-Argument Alignment**: Automatically appends a language-consistency rule to `custom_prompt` for Chinese / Japanese / Korean tool sessions so log lines, filenames, and search queries stay verbatim rather than being translated into English; optionally strips upstream `reasoning_content` via environment variable.
 
@@ -193,11 +206,12 @@ When monthly overage (`overage_monthly`) is enabled on an account, it is display
 - `MAGPIE_QUICK_AGENT_MODE`: Draft Agent channel switch (default `off`, staying on the inline `<instructions>` path). Set to `carrier` to enable the draft-agent instruction layer.
 - `MAGPIE_QUICK_AGENT_CACHE_FILE`: Path of the carrier draft-agent cache (default `<quickworkDir>/carrier-agents.json`, normally `~/.quickwork/carrier-agents.json`; also honours `QUICKWORK_DIR` / `AWS_QUICK_DIR`). Only successfully created `agentId`s are stored, failures are never written, and any read/write error silently falls back to memory.
 - `MAGPIE_QUICK_WEB_SEARCH`: Default for `web_search_enabled` when a request does not set it (on by default, matching the desktop app). Set to `false` / `0` / `off` / `no` to default off so Quick's cloud search cannot answer ahead of the caller's own tool chain; an explicit request field always wins.
+- `MAGPIE_QUICK_DEVICE_TOOLS`: Native device tools switch (default `off`). Set to `1` / `true` / `yes` / `on` so `tool_call` frames sent by the model are executed on this machine by the plugin; equivalent to `deps.nativeDeviceTools: true`, and `deps.onDeviceToolCall` supplies a custom executor.
 
 ## Tests
 
 ```bash
-node --test index.test.mjs
+node --test index.test.mjs device-tools.test.mjs
 ```
 
 ## License
